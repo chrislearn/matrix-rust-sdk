@@ -16,7 +16,11 @@ use std::{collections::HashMap, ops::ControlFlow, sync::Arc};
 
 use matrix_sdk_base::RoomInfoNotableUpdateReasons;
 use ruma::{EventId, OwnedEventId, UserId, events::room::power_levels::RoomPowerLevels};
-use tokio::sync::{OnceCell, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+#[cfg(not(feature = "hagency-bounded-history"))]
+use tokio::sync::OnceCell;
+#[cfg(not(feature = "hagency-bounded-history"))]
+use crate::event_cache::{EventCacheError,RoomEventCache};
 use tracing::{debug, error, instrument, warn};
 
 use super::{
@@ -26,7 +30,7 @@ use super::{
 use crate::{
     Room,
     event_cache::{
-        BackPaginationOutcome, EventCache, EventCacheError, RoomEventCache,
+        BackPaginationOutcome, EventCache,
         back_pagination_queue::{self, BackPaginationRequest},
     },
     room::WeakRoom,
@@ -54,6 +58,7 @@ impl RoomLatestEvents {
                 per_thread: HashMap::new(),
                 weak_room,
                 event_cache: event_cache.clone(),
+                #[cfg(not(feature = "hagency-bounded-history"))]
                 room_event_cache: OnceCell::new(),
             })),
         })
@@ -91,6 +96,7 @@ struct RoomLatestEventsState {
     event_cache: EventCache,
 
     /// The room event cache (lazily-loaded).
+    #[cfg(not(feature = "hagency-bounded-history"))]
     room_event_cache: OnceCell<RoomEventCache>,
 
     /// The (weak) room.
@@ -169,7 +175,16 @@ impl RoomLatestEventsWriteGuard {
         let for_the_room = &mut inner.for_the_room;
         let per_thread = &mut inner.per_thread;
 
-        // Lazy-load the `RoomEventCache`.
+        // Preview projections must not pin every joined room's working cache.
+        // Acquire a handle only for this update; cancellation drops it too.
+        #[cfg(feature = "hagency-bounded-history")]
+        let bounded_cache=match inner.event_cache.room(room.room_id()).await {
+            Ok((cache,_drop_handles))=>cache,
+            Err(err)=>{error!(room_id=?room.room_id(),?err,"Failed to fetch the room cache");return;}
+        };
+        #[cfg(feature = "hagency-bounded-history")]
+        let room_event_cache=&bounded_cache;
+        #[cfg(not(feature = "hagency-bounded-history"))]
         let room_event_cache = match inner
             .room_event_cache
             .get_or_try_init(|| async {
@@ -226,7 +241,16 @@ impl RoomLatestEventsWriteGuard {
         let for_the_room = &mut inner.for_the_room;
         let per_thread = &mut inner.per_thread;
 
-        // Lazy-load the `RoomEventCache`.
+        // Preview projections must not pin every joined room's working cache.
+        // Acquire a handle only for this update; cancellation drops it too.
+        #[cfg(feature = "hagency-bounded-history")]
+        let bounded_cache=match inner.event_cache.room(room.room_id()).await {
+            Ok((cache,_drop_handles))=>cache,
+            Err(err)=>{error!(room_id=?room.room_id(),?err,"Failed to fetch the room cache");return;}
+        };
+        #[cfg(feature = "hagency-bounded-history")]
+        let room_event_cache=&bounded_cache;
+        #[cfg(not(feature = "hagency-bounded-history"))]
         let room_event_cache = match inner
             .room_event_cache
             .get_or_try_init(|| async {

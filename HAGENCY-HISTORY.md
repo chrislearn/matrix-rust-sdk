@@ -26,3 +26,6 @@ required for persistent search across discarded working windows.
 
 Validation is performed by Hagency's real SDK/local HTTP/SQLite integration
 tests and encrypted storage tests. See its dev-vibe report for measured scope.
+
+Latest-event previews acquire a room cache only for each update. Their old
+OnceCell otherwise pins every joined room and prevents safe global eviction.
