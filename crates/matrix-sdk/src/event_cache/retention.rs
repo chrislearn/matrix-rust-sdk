@@ -55,7 +55,12 @@ pub(super) async fn load(
         Some(ChunkContent::Gap(gap)) => (Some(gap), Vec::new()),
         None => (None, Vec::new()),
     };
-    validate(events.iter())?;
+    // A legacy last chunk can exceed the new byte budget. Keep a bounded
+    // suffix rather than making the room impossible to open on upgrade.
+    let mut bytes=0usize;
+    let mut events:Vec<_>=events.into_iter().rev().filter(|event|event.raw().json().get().len()<=MAX_EVENT_BYTES)
+        .take(KEEP_EVENTS).take_while(|event|{bytes+=event.raw().json().get().len();bytes<=MAX_BYTES}).collect();
+    events.reverse();
     if let LinkedChunkId::Room(room)=id {
         // First upgrade also removes legacy, potentially unbounded detached
         // payloads and thread/pin chunks before any all-events redecryption.

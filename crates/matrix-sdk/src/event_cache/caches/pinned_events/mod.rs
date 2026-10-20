@@ -343,6 +343,9 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
                 None,
             )?;
 
+            #[cfg(feature = "hagency-bounded-history")]
+            crate::event_cache::retention::validate(self.state.chunk.events().map(|(_,event)|event))?;
+
             // Reload the entire chunk.
             while let Some(previous_chunk) =
                 self.store.load_previous_chunk(linked_chunk_id, current_chunk_identifier).await?

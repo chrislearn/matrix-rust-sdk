@@ -163,6 +163,11 @@ impl PaginatedCache for ThreadEventCacheWrapper {
             }
         };
 
+        #[cfg(feature = "hagency-bounded-history")]
+        if let ChunkContent::Items(events)=&new_first_chunk.content {
+            crate::event_cache::retention::validate(state.thread_linked_chunk().events().map(|(_,event)|event).chain(events.iter()))?;
+        }
+
         let chunk_content = new_first_chunk.content.clone();
 
         // We've reached the start on disk, if and only if, there was no chunk prior to
