@@ -178,9 +178,9 @@ impl RoomLatestEventsWriteGuard {
         // Preview projections must not pin every joined room's working cache.
         // Acquire a handle only for this update; cancellation drops it too.
         #[cfg(feature = "hagency-bounded-history")]
-        let bounded_cache=match inner.event_cache.room(room.room_id()).await {
-            Ok((cache,_drop_handles))=>cache,
-            Err(err)=>{error!(room_id=?room.room_id(),?err,"Failed to fetch the room cache");return;}
+        let bounded_cache=match inner.event_cache.room_if_cached(room.room_id()).await {
+            Some(cache)=>cache,
+            None=>return,
         };
         #[cfg(feature = "hagency-bounded-history")]
         let room_event_cache=&bounded_cache;

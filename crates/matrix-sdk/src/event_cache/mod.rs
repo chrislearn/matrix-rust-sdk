@@ -412,6 +412,13 @@ impl EventCache {
     }
 
     /// Return a room-specific view over the [`EventCache`].
+    /// Acquire an existing disposable room cache without bringing an evicted
+    /// room back into memory merely to refresh a latest-event preview.
+    #[cfg(feature = "hagency-bounded-history")]
+    pub(crate) async fn room_if_cached(&self,room_id:&RoomId) -> Option<RoomEventCache> {
+        self.inner.by_room.read().await.get(room_id).map(|caches|caches.room().clone())
+    }
+
     pub async fn room(
         &self,
         room_id: &RoomId,
