@@ -411,7 +411,6 @@ impl EventCache {
         self.inner.drop_handles.get().is_some()
     }
 
-    /// Return a room-specific view over the [`EventCache`].
     /// Acquire an existing disposable room cache without bringing an evicted
     /// room back into memory merely to refresh a latest-event preview.
     #[cfg(feature = "hagency-bounded-history")]
@@ -419,6 +418,7 @@ impl EventCache {
         self.inner.by_room.read().await.get(room_id).map(|caches|caches.room().clone())
     }
 
+    /// Return a room-specific view over the [`EventCache`].
     pub async fn room(
         &self,
         room_id: &RoomId,
