@@ -307,6 +307,9 @@ impl PaginatedCache for ThreadEventCacheWrapper {
         }
 
         let mut state = self.cache.state.write().await?;
+        #[cfg(feature = "hagency-bounded-history")]
+        crate::event_cache::retention::validate(state.thread_linked_chunk().events().map(|(_,event)|event).chain(events.iter()))?;
+
 
         // Check that the previous token still exists; otherwise it's a sign that the
         // thread's timeline has been cleared.

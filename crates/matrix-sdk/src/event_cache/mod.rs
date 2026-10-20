@@ -60,6 +60,8 @@ pub(crate) mod back_pagination_queue;
 mod caches;
 mod deduplicator;
 mod persistence;
+#[cfg(feature = "hagency-bounded-history")]
+mod retention;
 #[cfg(feature = "e2e-encryption")]
 mod redecryptor;
 mod states;
@@ -91,6 +93,9 @@ use self::{
 /// An error observed in the [`EventCache`].
 #[derive(thiserror::Error, Clone, Debug)]
 pub enum EventCacheError {
+    /// The bounded history cache requires a fresh event context to continue.
+    #[error("History window budget reached; open a new event context to continue")]
+    HistoryWindowFull,
     /// The [`EventCache`] instance hasn't been initialized with
     /// [`EventCache::subscribe`]
     #[error(
@@ -748,6 +753,18 @@ impl EventCacheInner {
                         Err(by_room_guard) => by_room_guard,
                     };
 
+                #[cfg(feature = "hagency-bounded-history")]
+                if by_room_guard.len() >= 32 {
+                    let mut unused = Vec::new();
+                    for (id, caches) in by_room_guard.iter() {
+                        if caches.is_unused().await { unused.push(id.clone()); }
+                    }
+                    for id in unused {
+                        by_room_guard.remove(&id);
+                        self.state.remove_room_memory(&id).await?;
+                    }
+                    if by_room_guard.len() >= 32 {return Err(EventCacheError::HistoryWindowFull);}
+                }
                 let caches = Caches::new(
                     &self.client,
                     room_id,

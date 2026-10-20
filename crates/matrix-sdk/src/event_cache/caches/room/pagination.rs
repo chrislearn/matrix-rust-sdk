@@ -334,6 +334,9 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
         mut new_token: Option<String>,
     ) -> Result<Option<BackPaginationOutcome>> {
         let mut state = self.state.write().await?;
+        #[cfg(feature = "hagency-bounded-history")]
+        crate::event_cache::retention::validate(state.room_linked_chunk().events().map(|(_,event)|event).chain(events.iter()))?;
+
 
         // Check that the previous token still exists; otherwise it's a sign that the
         // room's timeline has been cleared.

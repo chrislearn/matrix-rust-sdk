@@ -92,6 +92,10 @@ impl fmt::Debug for ThreadEventCache {
 }
 
 impl ThreadEventCache {
+    #[cfg(feature = "hagency-bounded-history")]
+    pub(super) async fn is_unused(&self) -> bool {
+        Arc::strong_count(&self.inner) == 1 && self.inner.state.read().await.is_ok_and(|s|s.subscribers_handle().count()==0)
+    }
     /// Create a new empty thread event cache.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn new(

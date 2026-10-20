@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::iter::empty;
+#[cfg(not(feature = "hagency-bounded-history"))]
+use matrix_sdk_base::linked_chunk::lazy_loader;
 
 use eyeball::{AsyncLock, ObservableWriteGuard, SharedObservable};
 use eyeball_im::VectorDiff;
@@ -21,7 +23,7 @@ use matrix_sdk_base::{
     deserialized_responses::ThreadSummary,
     event_cache::{Event, Gap, store::EventCacheStoreLockGuard, thread::ThreadInfo},
     linked_chunk::{
-        ChunkIdentifierGenerator, LinkedChunkId, OwnedLinkedChunkId, Position, Update, lazy_loader,
+        ChunkIdentifierGenerator, LinkedChunkId, OwnedLinkedChunkId, Position, Update,
     },
     serde_helpers::extract_redaction_target,
     sync::Timeline,
@@ -138,6 +140,10 @@ impl ThreadEventCacheState {
         // events or linked chunks.
         let thread_info = store_guard.load_thread_info(&room_id, &thread_id).await?;
 
+        #[cfg(feature = "hagency-bounded-history")]
+        let thread_linked_chunk = crate::event_cache::retention::load(&store_guard, linked_chunk_id).await?;
+        #[cfg(not(feature = "hagency-bounded-history"))]
+        let thread_linked_chunk = {
         // Load the full linked chunk's metadata, so as to feed the order tracker.
         //
         // If loading the full linked chunk failed, we'll clear the event cache, as it
@@ -179,16 +185,16 @@ impl ThreadEventCacheState {
             }
         };
 
+            EventLinkedChunk::with_initial_linked_chunk(linked_chunk, full_linked_chunk_metadata)
+        };
+
         Ok(ThreadEventCacheState {
             room_id,
             thread_id,
             weak_room,
             own_user_id,
             room_version_rules,
-            thread_linked_chunk: EventLinkedChunk::with_initial_linked_chunk(
-                linked_chunk,
-                full_linked_chunk_metadata,
-            ),
+            thread_linked_chunk,
             thread_info: SharedObservable::new_async(thread_info),
             update_sender,
             linked_chunk_update_sender,
@@ -269,6 +275,8 @@ impl ThreadEventCacheState {
     }
 
     pub async fn propagate_changes(&mut self, store: &EventCacheStoreLockGuard) -> Result<()> {
+        #[cfg(feature = "hagency-bounded-history")]
+        crate::event_cache::retention::compact(&mut self.thread_linked_chunk);
         let updates = self.thread_linked_chunk.store_updates().take();
 
         self.send_updates_to_store(updates, store).await
@@ -462,6 +470,10 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
         read_receipts: &MaybeReceiptEventContent,
     ) -> Result<(bool, Vec<VectorDiff<Event>>)> {
         let prev_batch_token = &timeline.prev_batch;
+        #[cfg(feature = "hagency-bounded-history")]
+        for event in &timeline.events {
+            if event.raw().json().get().len() > 256 * 1024 {return Err(EventCacheError::HistoryWindowFull);}
+        }
 
         let DeduplicationOutcome {
             all_events: events,
@@ -664,6 +676,8 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
         location: EventLocation,
         new_event: Event,
     ) -> Result<()> {
+        #[cfg(feature = "hagency-bounded-history")]
+        if new_event.raw().json().get().len()>256*1024 {return Err(EventCacheError::HistoryWindowFull);}
         match location {
             EventLocation::Memory(position) => {
                 self.state

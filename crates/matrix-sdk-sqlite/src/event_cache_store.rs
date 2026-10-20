@@ -1101,6 +1101,9 @@ impl EventCacheStore for SqliteEventCacheStore {
                 }
             }
 
+            #[cfg(feature = "hagency-bounded-history")]
+            prune_detached_history_events(txn,&hashed_room_id)?;
+
             Ok(())
         })
         .await?;
@@ -1813,6 +1816,8 @@ impl EventCacheStore for SqliteEventCacheStore {
                     )
                 )?;
 
+                #[cfg(feature = "hagency-bounded-history")]
+                prune_detached_history_events(txn,&hashed_room_id)?;
                 Ok(())
             })
             .await
@@ -1833,6 +1838,19 @@ impl EventCacheStore for SqliteEventCacheStore {
     async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
         self.get_db_size().await
     }
+}
+
+/// Bound detached, disposable event payloads after a working chunk is evicted.
+/// Referenced room/thread/pin events remain intact. No authentication/crypto or
+/// durable send-queue data lives in this database.
+#[cfg(feature = "hagency-bounded-history")]
+fn prune_detached_history_events(txn: &Transaction<'_>, room: &Key) -> Result<()> {
+    txn.execute("DELETE FROM events WHERE room_id=?1
+        AND NOT EXISTS(SELECT 1 FROM event_chunks c WHERE c.event_id=events.event_id)
+        AND event_id NOT IN(SELECT e.event_id FROM events e WHERE e.room_id=?1
+            AND NOT EXISTS(SELECT 1 FROM event_chunks c WHERE c.event_id=e.event_id)
+            ORDER BY e.event_id DESC LIMIT 64)", (room,))?;
+    Ok(())
 }
 
 fn find_event_relations_transaction(

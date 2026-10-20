@@ -68,6 +68,10 @@ impl fmt::Debug for RoomEventCache {
 }
 
 impl RoomEventCache {
+    #[cfg(feature = "hagency-bounded-history")]
+    pub(super) async fn is_unused(&self) -> bool {
+        Arc::strong_count(&self.inner) == 1 && self.inner.state.read().await.is_ok_and(|s|s.subscribers_handle().count()==0)
+    }
     /// Create a new [`RoomEventCache`] using the given room and store.
     pub(super) fn new(
         room_id: OwnedRoomId,
@@ -447,6 +451,8 @@ impl RoomEventCacheInner {
 
         let (stored_prev_batch_token, timeline_event_diffs) =
             state.handle_sync(timeline, &read_receipts).await?;
+        #[cfg(feature = "hagency-bounded-history")]
+        let cleared=timeline_event_diffs.iter().any(|diff|matches!(diff,eyeball_im::VectorDiff::Clear));
 
         drop(state);
 
@@ -471,6 +477,11 @@ impl RoomEventCacheInner {
         if let Some(read_receipts) = read_receipts.into_inner() {
             self.update_sender
                 .send(RoomEventCacheUpdate::AddReadReceiptEvent { event: read_receipts }, None);
+        }
+        #[cfg(feature = "hagency-bounded-history")]
+        if cleared && let Some(room)=self.weak_room.get()
+            && let Some(event_id)=room.fully_read_event_id() {
+            self.update_sender.send(RoomEventCacheUpdate::MoveReadMarkerTo{event_id},None);
         }
 
         if !ambiguity_changes.is_empty() || avatar_changes.as_ref().is_some_and(|c| !c.is_empty()) {

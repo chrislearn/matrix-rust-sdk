@@ -121,6 +121,8 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
     }
 
     async fn handle_sync(&mut self, timeline: Timeline) -> Result<()> {
+        #[cfg(feature = "hagency-bounded-history")]
+        for event in &timeline.events {crate::event_cache::retention::validate(std::iter::once(event))?;}
         let DeduplicationOutcome {
             all_events: events,
             in_memory_duplicated_event_ids,
@@ -346,6 +348,10 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
                 self.store.load_previous_chunk(linked_chunk_id, current_chunk_identifier).await?
             {
                 current_chunk_identifier = previous_chunk.identifier;
+                #[cfg(feature = "hagency-bounded-history")]
+                if let matrix_sdk_base::linked_chunk::ChunkContent::Items(events)=&previous_chunk.content {
+                    crate::event_cache::retention::validate(self.state.chunk.events().map(|(_,event)|event).chain(events.iter()))?;
+                }
                 self.state.chunk.insert_new_chunk_as_first(previous_chunk)?;
             }
         }
@@ -360,6 +366,8 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
     }
 
     async fn replace_all_events(&mut self, new_events: Vec<Event>) -> Result<()> {
+        #[cfg(feature = "hagency-bounded-history")]
+        crate::event_cache::retention::validate(new_events.iter())?;
         trace!("resetting all pinned events in linked chunk");
 
         let previous_pinned_event_ids = self.state.current_event_ids();
@@ -389,6 +397,8 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
     /// Propagate the changes in this linked chunk to observers, and save the
     /// changes on disk.
     pub async fn propagate_changes(&mut self) -> Result<()> {
+        #[cfg(feature = "hagency-bounded-history")]
+        crate::event_cache::retention::compact(&mut self.state.chunk);
         let updates = self.state.chunk.store_updates().take();
 
         self.send_updates_to_store(updates).await
@@ -450,6 +460,10 @@ struct PinnedEventsCacheInner {
 }
 
 impl PinnedEventsCache {
+    #[cfg(feature = "hagency-bounded-history")]
+    pub(super) async fn is_unused(&self) -> bool {
+        Arc::strong_count(&self._task) == 1 && self.inner.state.read().await.is_ok_and(|s|s.update_sender.receiver_count()==0)
+    }
     /// Creates a new [`PinnedEventsCache`] for the given room.
     pub(in super::super) async fn new(
         weak_room: &WeakRoom,

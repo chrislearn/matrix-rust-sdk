@@ -82,6 +82,14 @@ struct CachesInternals {
 }
 
 impl Caches {
+    #[cfg(feature = "hagency-bounded-history")]
+    pub(super) async fn is_unused(&self) -> bool {
+        if !self.room.is_unused().await { return false; }
+        if let Some(pinned)=self.pinned_events.get() {if !pinned.is_unused().await {return false;}}
+        for cache in self.threads.read().await.values() { if !cache.is_unused().await {return false;} }
+        for cache in self.event_focused.read().await.values() { if !cache.is_unused().await {return false;} }
+        true
+    }
     /// Create a new [`Caches`].
     pub async fn new(
         weak_client: &WeakClient,
@@ -201,6 +209,14 @@ impl Caches {
                 Ok(locked_cache) => locked_cache,
                 // Thread does not exist, let's create it.
                 Err(mut threads) => {
+                    #[cfg(feature = "hagency-bounded-history")]
+                    {
+                        let mut unused = Vec::new();
+                        for (id,cache) in threads.iter() {if cache.is_unused().await {unused.push(id.clone());}}
+                        for id in &unused {threads.remove(id);}
+                        self.internals.state.remove_threads(self.room.room_id(),&unused).await?;
+                        if threads.len()>=32 {return Err(EventCacheError::HistoryWindowFull);}
+                    }
                     let room = &self.room;
                     let cache = thread::ThreadEventCache::new(
                         room.room_id().to_owned(),
@@ -256,7 +272,14 @@ impl Caches {
             event_focused::EventFocusedCache,
         >,
     > {
-        let key = event_focused::EventFocusedCacheKey { focused_event_id: event_id, thread_mode };
+        let key = event_focused::EventFocusedCacheKey {
+            focused_event_id: event_id, thread_mode,
+            #[cfg(feature = "hagency-bounded-history")]
+            generation: {
+                static GENERATION: std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(1);
+                GENERATION.fetch_add(1,std::sync::atomic::Ordering::Relaxed)
+            },
+        };
 
         Ok(
             match OwnedRwLockWriteGuard::try_downgrade_map(
@@ -267,6 +290,16 @@ impl Caches {
                 Ok(locked_cache) => locked_cache,
                 // Event-focused cache does not exist, let's create it.
                 Err(mut event_focused_caches) => {
+                    #[cfg(feature = "hagency-bounded-history")]
+                    {
+                        let mut unused = Vec::new();
+                        for (key, cache) in event_focused_caches.iter() {
+                            if cache.is_unused().await { unused.push(key.clone()); }
+                        }
+                        for key in &unused { event_focused_caches.remove(key); }
+                        self.internals.state.remove_contexts(self.room.room_id(), &unused).await?;
+                        if event_focused_caches.len() >= 32 { return Err(EventCacheError::HistoryWindowFull); }
+                    }
                     let cache = event_focused::EventFocusedCache::new(
                         self.room.weak_room().clone(),
                         key.clone(),
@@ -274,7 +307,11 @@ impl Caches {
                         self.internals.linked_chunk_update_sender.clone(),
                     )
                     .await?;
-                    cache.start_from(number_of_initial_events, thread_mode).await?;
+                    if let Err(error)=cache.start_from(number_of_initial_events, thread_mode).await {
+                        #[cfg(feature = "hagency-bounded-history")]
+                        self.internals.state.remove_contexts(self.room.room_id(),std::slice::from_ref(&key)).await?;
+                        return Err(error);
+                    }
 
                     event_focused_caches.insert(key.clone(), cache);
 

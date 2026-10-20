@@ -185,6 +185,9 @@ impl EventFocusedCacheState {
         let result =
             paginator.start_from(&self.focused_event_id, UInt::from(num_context_events)).await?;
 
+        #[cfg(feature = "hagency-bounded-history")]
+        crate::event_cache::retention::validate(result.events.iter())?;
+
         // Detect if the focused event is part of a thread.
         let thread_root = match thread_mode {
             EventFocusThreadMode::ForceThread => {
@@ -349,6 +352,11 @@ impl EventFocusedCacheState {
     /// there are more events to fetch.
     #[instrument(skip(self), fields(room_id = %self.room.room_id()))]
     async fn paginate_backwards(&mut self, num_events: u16) -> Result<PaginationResult> {
+        #[cfg(feature = "hagency-bounded-history")]
+        if self.chunk.events().count() + usize::from(num_events) > crate::event_cache::retention::MAX_EVENTS {
+            return Err(EventCacheError::HistoryWindowFull);
+        }
+
         let room = self.room.get().ok_or(EventCacheError::ClientDropped)?;
 
         // Find the gap at the front (backward pagination token).
@@ -388,6 +396,9 @@ impl EventFocusedCacheState {
         } else {
             events
         };
+
+        #[cfg(feature = "hagency-bounded-history")]
+        crate::event_cache::retention::validate(self.chunk.events().map(|(_,event)|event).chain(events.iter()))?;
 
         // Replace the gap and insert the new events.
         self.chunk.push_backwards_pagination_events(Some(gap_id), new_gap, &events);
@@ -461,6 +472,11 @@ impl EventFocusedCacheState {
     /// there are more events to fetch.
     #[instrument(skip(self), fields(room_id = %self.room.room_id()))]
     async fn paginate_forwards(&mut self, num_events: u16) -> Result<PaginationResult> {
+        #[cfg(feature = "hagency-bounded-history")]
+        if self.chunk.events().count() + usize::from(num_events) > crate::event_cache::retention::MAX_EVENTS {
+            return Err(EventCacheError::HistoryWindowFull);
+        }
+
         let room = self.room.get().ok_or(EventCacheError::ClientDropped)?;
 
         // Find the gap at the back (forward pagination token).
@@ -496,6 +512,9 @@ impl EventFocusedCacheState {
         } else {
             events
         };
+
+        #[cfg(feature = "hagency-bounded-history")]
+        crate::event_cache::retention::validate(self.chunk.events().map(|(_,event)|event).chain(events.iter()))?;
 
         // Replace the gap and insert new events.
         self.chunk.push_forwards_pagination_events(Some(gap_id), new_gap, &events);
@@ -568,6 +587,10 @@ pub struct EventFocusedCache {
 }
 
 impl EventFocusedCache {
+    #[cfg(feature = "hagency-bounded-history")]
+    pub(super) async fn is_unused(&self) -> bool {
+        Arc::strong_count(&self.inner) == 1 && self.inner.read().await.is_ok_and(|s|s.update_sender.receiver_count()==0)
+    }
     /// Create a new empty event-focused cache.
     pub(super) async fn new(
         room: WeakRoom,
@@ -693,6 +716,9 @@ impl std::fmt::Debug for EventFocusedCache {
 /// Key for the event-focused caches.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct EventFocusedCacheKey {
+    /// A fresh browsing window, including when rebasing to the same event.
+    #[cfg(feature = "hagency-bounded-history")]
+    pub generation: u64,
     /// The event ID that the cache is focused on.
     pub focused_event_id: OwnedEventId,
     /// The thread mode for this cache.

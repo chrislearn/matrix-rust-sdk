@@ -11,6 +11,8 @@ rust-version.workspace = true
 rustdoc-args = ["--generate-link-to-definition"]
 
 [features]
+# Bound disposable history working sets; server history remains authoritative.
+hagency-bounded-history = []
 default = ["state-store", "event-cache-store", "media-store"]
 testing = ["matrix-sdk-crypto?/testing"]
 

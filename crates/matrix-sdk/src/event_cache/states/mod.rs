@@ -81,6 +81,31 @@ struct StateLockInner {
 }
 
 impl StateLock {
+    #[cfg(feature = "hagency-bounded-history")]
+    pub(super) async fn remove_threads(&self, room: &RoomId, ids: &[OwnedEventId]) -> Result<()> {
+        let mut guard=self.write().await?;
+        for id in ids {
+            guard.store.handle_linked_chunk_updates(matrix_sdk_base::linked_chunk::LinkedChunkId::Thread(room,id),
+                vec![matrix_sdk_base::linked_chunk::Update::Clear]).await?;
+        }
+        if let Some(room)=guard.state.by_room.get_mut(room) {for id in ids {room.threads.remove(id);}}
+        Ok(())
+    }
+    #[cfg(feature = "hagency-bounded-history")]
+    pub(super) async fn remove_room_memory(&self, room: &RoomId) -> Result<()> {
+        let mut guard=self.write().await?;
+        guard.store.clear_all_events(Some(room)).await?;
+        guard.state.by_room.remove(room);
+        Ok(())
+    }
+    #[cfg(feature = "hagency-bounded-history")]
+    pub(super) async fn remove_contexts(&self, room: &RoomId, keys: &[EventFocusedCacheKey]) -> Result<()> {
+        let mut guard = self.write().await?;
+        if let Some(room) = guard.state.by_room.get_mut(room) {
+            for key in keys { room.event_focused.remove(key); }
+        }
+        Ok(())
+    }
     /// Construct a new [`EventCacheStateLock`].
     pub fn new(store: EventCacheStoreLock) -> Self {
         Self {

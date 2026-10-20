@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::iter::empty;
+#[cfg(not(feature = "hagency-bounded-history"))]
+use matrix_sdk_base::linked_chunk::lazy_loader;
 
 use eyeball::SharedObservable;
 use eyeball_im::VectorDiff;
@@ -21,7 +23,7 @@ use matrix_sdk_base::{
     deserialized_responses::{ThreadSummary, ThreadSummaryStatus},
     event_cache::{Event, Gap, store::EventCacheStoreLockGuard},
     linked_chunk::{
-        ChunkIdentifierGenerator, LinkedChunkId, OwnedLinkedChunkId, Position, Update, lazy_loader,
+        ChunkIdentifierGenerator, LinkedChunkId, OwnedLinkedChunkId, Position, Update,
     },
     serde_helpers::extract_redaction_target,
     sync::Timeline,
@@ -135,6 +137,10 @@ impl RoomEventCacheState {
     ) -> Result<Self, EventCacheError> {
         let linked_chunk_id = LinkedChunkId::Room(&room_id);
 
+        #[cfg(feature = "hagency-bounded-history")]
+        let room_linked_chunk = crate::event_cache::retention::load(&store_guard, linked_chunk_id).await?;
+        #[cfg(not(feature = "hagency-bounded-history"))]
+        let room_linked_chunk = {
         // Load the full linked chunk's metadata, so as to feed the order tracker.
         //
         // If loading the full linked chunk failed, we'll clear the event cache, as it
@@ -176,15 +182,15 @@ impl RoomEventCacheState {
             }
         };
 
+            EventLinkedChunk::with_initial_linked_chunk(linked_chunk, full_linked_chunk_metadata)
+        };
+
         Ok(RoomEventCacheState {
             own_user_id,
             enabled_thread_support,
             room_id,
             weak_room,
-            room_linked_chunk: EventLinkedChunk::with_initial_linked_chunk(
-                linked_chunk,
-                full_linked_chunk_metadata,
-            ),
+            room_linked_chunk,
             pagination_status,
             update_sender,
             linked_chunk_update_sender,
@@ -473,6 +479,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     }
 
     pub(super) async fn propagate_changes(&mut self) -> Result<(), EventCacheError> {
+        #[cfg(feature = "hagency-bounded-history")]
+        crate::event_cache::retention::compact(&mut self.state.room_linked_chunk);
         let updates = self.state.room_linked_chunk.store_updates().take();
 
         self.send_updates_to_store(updates).await
@@ -520,6 +528,12 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         mut timeline: Timeline,
         read_receipt_event: &MaybeReceiptEventContent,
     ) -> Result<(bool, Vec<VectorDiff<Event>>), EventCacheError> {
+        #[cfg(feature = "hagency-bounded-history")]
+        for event in &timeline.events {
+            if event.raw().json().get().len() > 256 * 1024 {
+                return Err(EventCacheError::HistoryWindowFull);
+            }
+        }
         let mut prev_batch_token = timeline.prev_batch.take();
 
         let DeduplicationOutcome {
@@ -710,6 +724,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         location: EventLocation,
         event: Event,
     ) -> Result<(), EventCacheError> {
+        #[cfg(feature = "hagency-bounded-history")]
+        if event.raw().json().get().len()>256*1024 {return Err(EventCacheError::HistoryWindowFull);}
         match location {
             EventLocation::Memory(position) => {
                 self.state

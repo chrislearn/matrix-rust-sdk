@@ -23,6 +23,8 @@ pub struct PinnedEventsCacheUpdateSender {
 }
 
 impl PinnedEventsCacheUpdateSender {
+    #[cfg(feature = "hagency-bounded-history")]
+    pub(super) fn receiver_count(&self) -> usize { self.thread_sender.receiver_count() }
     /// Create a new [`PinnedEventsCacheUpdateSender`].
     pub fn new() -> Self {
         Self { thread_sender: Sender::new(32) }
