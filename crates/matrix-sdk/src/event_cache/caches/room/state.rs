@@ -828,6 +828,9 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     ) -> Result<(), EventCacheError> {
         let store = self.store.clone();
         let room_id = self.state.room_id.clone();
+        #[cfg(feature = "hagency-bounded-history")]
+        let events = crate::event_cache::retention::collect(events)?;
+        #[cfg(not(feature = "hagency-bounded-history"))]
         let events = events.into_iter().collect::<Vec<_>>();
 
         // Spawn a task so the save is uninterrupted by task cancellation.

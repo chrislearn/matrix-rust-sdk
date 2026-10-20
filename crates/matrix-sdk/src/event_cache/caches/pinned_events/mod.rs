@@ -17,7 +17,7 @@ mod updates;
 use std::{cmp::Ordering, collections::BTreeSet, fmt, sync::Arc};
 
 use eyeball_im::VectorDiff;
-use futures_util::{StreamExt as _, stream};
+use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use matrix_sdk_base::{
     apply_redaction,
     event_cache::{Event, Gap},
@@ -299,6 +299,9 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
     pub async fn save_events(&mut self, events: impl IntoIterator<Item = Event>) -> Result<()> {
         let store = self.store.clone();
         let room_id = self.state.room_id.clone();
+        #[cfg(feature = "hagency-bounded-history")]
+        let events = crate::event_cache::retention::collect(events)?;
+        #[cfg(not(feature = "hagency-bounded-history"))]
         let events = events.into_iter().collect::<Vec<_>>();
 
         // Spawn a task so the save is uninterrupted by task cancellation.
@@ -729,8 +732,14 @@ impl PinnedEventsCache {
             .flat_map(stream::iter)
             // Flatten the list of `Vec<Event>` into a list of `Event`.
             .flat_map(stream::iter)
-            .collect()
-            .await;
+            .map(Ok::<_,EventCacheError>)
+            .try_fold(Vec::new(),|mut events,event|async move {
+                #[cfg(feature = "hagency-bounded-history")]
+                crate::event_cache::retention::validate(events.iter().chain(std::iter::once(&event)))?;
+                events.push(event);
+                Ok::<_,EventCacheError>(events)
+            })
+            .await?;
 
         if num_successful_loads != pinned_event_ids.len() {
             warn!(

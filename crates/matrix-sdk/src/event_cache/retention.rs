@@ -27,6 +27,19 @@ pub(super) fn validate<'a>(events: impl Iterator<Item = &'a Event>) -> Result<()
     Ok(())
 }
 
+/// Bound side-loaded event batches before collecting them in memory.
+pub(super) fn collect(events:impl IntoIterator<Item=Event>) -> Result<Vec<Event>> {
+    let mut result=Vec::new();
+    let mut bytes=0usize;
+    for event in events {
+        validate(std::iter::once(&event))?;
+        bytes+=event.raw().json().get().len();
+        if result.len()>=MAX_EVENTS || bytes>MAX_BYTES {return Err(EventCacheError::HistoryWindowFull);}
+        result.push(event);
+    }
+    Ok(result)
+}
+
 pub(super) fn compact(chunk: &mut EventLinkedChunk) -> bool {
     if validate(chunk.events().map(|(_, event)|event)).is_ok() { return false; }
     // A Clear plus append resets the SDK controller's positional/aggregation
