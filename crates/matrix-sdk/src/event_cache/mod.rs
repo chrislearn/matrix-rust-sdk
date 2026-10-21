@@ -767,8 +767,8 @@ impl EventCacheInner {
                         if caches.is_unused().await { unused.push(id.clone()); }
                     }
                     for id in unused {
-                        by_room_guard.remove(&id);
                         self.state.remove_room_memory(&id).await?;
+                        by_room_guard.remove(&id);
                     }
                     if by_room_guard.len() >= 32 {return Err(EventCacheError::HistoryWindowFull);}
                 }

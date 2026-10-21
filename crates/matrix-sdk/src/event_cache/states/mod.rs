@@ -716,3 +716,62 @@ pub enum ReloadPreprocessing {
     /// Do nothing before reloading.
     None,
 }
+
+
+#[cfg(all(test, feature = "hagency-bounded-history"))]
+mod bounded_cancellation_tests {
+    use crate::{RoomState, event_cache::caches::event_focused::EventFocusThreadMode, test_utils::mocks::MatrixMockServer};
+    use std::time::Duration;
+    use wiremock::{Mock, ResponseTemplate, matchers::{method, path_regex}};
+
+    #[tokio::test]
+    async fn aborted_context_initialization_does_not_orphan_state() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room = ruma::room_id!("!cancel:example.org");
+        client.base_client().get_or_create_room(room, RoomState::Joined);
+        let event_cache = client.event_cache().clone();
+        event_cache.subscribe().unwrap();
+        Mock::given(method("GET")).and(path_regex(".*/context/.*"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(server.server()).await;
+        for round in 0..64 {
+            let inner = event_cache.inner.clone();
+            let task = tokio::spawn(async move {
+                let caches = inner.all_caches_for_room(room).await.unwrap();
+                let event = ruma::EventId::parse(format!("$cancel{round}")).unwrap();
+                let _ = caches.event_focused(event, EventFocusThreadMode::Automatic, 20).await;
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let requests = server.server().received_requests().await.unwrap();
+                    if requests.iter().filter(|request| request.url.path().contains("/context/")).count() > round { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            let state = event_cache.inner.state.inner.locked_state.read().await;
+            assert_eq!(state.by_room.get(room).unwrap().event_focused.len(), 1,
+                "cancelled contexts must be pruned before the next insertion");
+        }
+        server.server().reset().await;
+        Mock::given(method("GET")).and(path_regex(".*/context/.*"))
+            .respond_with(ResponseTemplate::new(404)).mount(server.server()).await;
+        let caches = event_cache.inner.all_caches_for_room(room).await.unwrap();
+        assert!(caches.event_focused(ruma::event_id!("$missing").to_owned(), EventFocusThreadMode::Automatic, 20).await.is_err());
+        let state = event_cache.inner.state.inner.locked_state.read().await;
+        assert!(state.by_room.get(room).unwrap().event_focused.is_empty());
+        drop(state);
+        drop(caches);
+        let cache_weak = std::sync::Arc::downgrade(&event_cache.inner);
+        let client_weak = crate::client::WeakClient::from_client(&client);
+        drop(event_cache);
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cache_weak.strong_count() != 0 || client_weak.strong_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("cancelled context tasks must not retain the client or event cache");
+    }
+}

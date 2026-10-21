@@ -60,6 +60,8 @@ impl RoomLatestEvents {
                 event_cache: event_cache.clone(),
                 #[cfg(not(feature = "hagency-bounded-history"))]
                 room_event_cache: OnceCell::new(),
+                #[cfg(feature = "hagency-bounded-history")]
+                initialized_event_cache: false,
             })),
         })
     }
@@ -98,6 +100,10 @@ struct RoomLatestEventsState {
     /// The room event cache (lazily-loaded).
     #[cfg(not(feature = "hagency-bounded-history"))]
     room_event_cache: OnceCell<RoomEventCache>,
+    /// Restore disk previews once without reviving every evicted cache on
+    /// subsequent generic updates (which can otherwise cause eviction loops).
+    #[cfg(feature = "hagency-bounded-history")]
+    initialized_event_cache: bool,
 
     /// The (weak) room.
     ///
@@ -180,8 +186,19 @@ impl RoomLatestEventsWriteGuard {
         #[cfg(feature = "hagency-bounded-history")]
         let bounded_cache=match inner.event_cache.room_if_cached(room.room_id()).await {
             Some(cache)=>cache,
+            None if !inner.initialized_event_cache => {
+                match inner.event_cache.room(room.room_id()).await {
+                    Ok((cache, _drop_handles)) => cache,
+                    Err(error) => {
+                        error!(room_id=?room.room_id(),?error,"Failed to restore the room preview cache");
+                        return;
+                    }
+                }
+            }
             None=>return,
         };
+        #[cfg(feature = "hagency-bounded-history")]
+        { inner.initialized_event_cache = true; }
         #[cfg(feature = "hagency-bounded-history")]
         let room_event_cache=&bounded_cache;
         #[cfg(not(feature = "hagency-bounded-history"))]
@@ -453,5 +470,37 @@ mod tests {
             room_latest_events.read().await.for_room().get().await,
             LatestEventValue::Remote(_)
         );
+    }
+
+    #[cfg(feature = "hagency-bounded-history")]
+    #[async_test]
+    async fn test_evicted_preview_caches_are_not_revived_by_later_updates() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+        let mut previews = Vec::new();
+        for index in 0..40 {
+            let room = ruma::RoomId::parse(format!("!preview{index}:example.org")).unwrap();
+            client.base_client().get_or_create_room(&room, RoomState::Joined);
+            let preview = RoomLatestEvents::new(
+                WeakRoom::new(WeakClient::from_client(&client), room.clone()), event_cache,
+            );
+            preview.write().await.update_with_event_cache().await;
+            assert!(event_cache.room_if_cached(&room).await.is_some(), "first preview access must load its disk cache");
+            previews.push((room, preview));
+        }
+        let evicted: Vec<_> = futures_util::future::join_all(previews.iter().map(|(room, _)| async move {
+            event_cache.room_if_cached(room).await.is_none()
+        })).await;
+        assert!(evicted.iter().any(|evicted| *evicted));
+        for _ in 0..3 {
+            for ((room, preview), evicted) in previews.iter().zip(&evicted) {
+                preview.write().await.update_with_event_cache().await;
+                if *evicted {
+                    assert!(event_cache.room_if_cached(room).await.is_none(), "generic updates must not cause cache eviction loops");
+                }
+            }
+        }
     }
 }

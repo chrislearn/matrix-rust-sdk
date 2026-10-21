@@ -85,7 +85,7 @@ impl Caches {
     #[cfg(feature = "hagency-bounded-history")]
     pub(super) async fn is_unused(&self) -> bool {
         if !self.room.is_unused().await { return false; }
-        if let Some(pinned)=self.pinned_events.get() {if !pinned.is_unused().await {return false;}}
+        if let Some(pinned)=self.pinned_events.get() && !pinned.is_unused().await {return false;}
         for cache in self.threads.read().await.values() { if !cache.is_unused().await {return false;} }
         for cache in self.event_focused.read().await.values() { if !cache.is_unused().await {return false;} }
         true
@@ -123,11 +123,14 @@ impl Caches {
         let own_user_id =
             client.user_id().expect("the user must be logged in, at this point").to_owned();
 
+        // Do not suspend between state insertion and returning its cache owner:
+        // cancellation in that interval would leave an untracked room state.
+        let mut timeline_is_not_empty = false;
         let room_state = state
             .try_insert_once_with(
                 states::selectors::RoomStateSelector::new(room_id.to_owned()),
-                |store_guard| {
-                    room::RoomEventCacheState::new(
+                async |store_guard| {
+                    let room_state = room::RoomEventCacheState::new(
                         own_user_id.clone(),
                         room_id.to_owned(),
                         weak_room.clone(),
@@ -138,13 +141,12 @@ impl Caches {
                         store_guard,
                         pagination_status.clone(),
                         back_pagination_queue,
-                    )
+                    ).await?;
+                    timeline_is_not_empty = room_state.room_linked_chunk().revents().next().is_some();
+                    Ok(room_state)
                 },
             )
             .await?;
-
-        let timeline_is_not_empty =
-            room_state.read().await?.room_linked_chunk().revents().next().is_some();
 
         let room_event_cache = room::RoomEventCache::new(
             room_id.to_owned(),
@@ -213,8 +215,8 @@ impl Caches {
                     {
                         let mut unused = Vec::new();
                         for (id,cache) in threads.iter() {if cache.is_unused().await {unused.push(id.clone());}}
-                        for id in &unused {threads.remove(id);}
                         self.internals.state.remove_threads(self.room.room_id(),&unused).await?;
+                        for id in &unused {threads.remove(id);}
                         if threads.len()>=32 {return Err(EventCacheError::HistoryWindowFull);}
                     }
                     let room = &self.room;
@@ -296,8 +298,8 @@ impl Caches {
                         for (key, cache) in event_focused_caches.iter() {
                             if cache.is_unused().await { unused.push(key.clone()); }
                         }
-                        for key in &unused { event_focused_caches.remove(key); }
                         self.internals.state.remove_contexts(self.room.room_id(), &unused).await?;
+                        for key in &unused { event_focused_caches.remove(key); }
                         if event_focused_caches.len() >= 32 { return Err(EventCacheError::HistoryWindowFull); }
                     }
                     let cache = event_focused::EventFocusedCache::new(
@@ -307,12 +309,23 @@ impl Caches {
                         self.internals.linked_chunk_update_sender.clone(),
                     )
                     .await?;
+                    // Register before the cancellable network initialization. An
+                    // aborted build must remain discoverable by the next prune;
+                    // otherwise its StateLock entry has no cache-map owner.
+                    #[cfg(feature = "hagency-bounded-history")]
+                    event_focused_caches.insert(key.clone(), cache.clone());
                     if let Err(error)=cache.start_from(number_of_initial_events, thread_mode).await {
                         #[cfg(feature = "hagency-bounded-history")]
-                        self.internals.state.remove_contexts(self.room.room_id(),std::slice::from_ref(&key)).await?;
+                        {
+                            // Keep the map owner until async state cleanup finishes,
+                            // including cancellation while waiting for the state lock.
+                            self.internals.state.remove_contexts(self.room.room_id(),std::slice::from_ref(&key)).await?;
+                            event_focused_caches.remove(&key);
+                        }
                         return Err(error);
                     }
 
+                    #[cfg(not(feature = "hagency-bounded-history"))]
                     event_focused_caches.insert(key.clone(), cache);
 
                     OwnedRwLockWriteGuard::downgrade_map(
