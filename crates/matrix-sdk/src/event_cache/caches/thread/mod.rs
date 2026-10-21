@@ -1449,4 +1449,80 @@ mod timed_tests {
         assert_eq!(events3.len(), 1);
         assert_eq!(events3[0].event_id(), Some(event_id_1));
     }
+    #[cfg(feature = "hagency-bounded-history")]
+    #[async_test]
+    async fn test_bounded_reload_external_growth_and_pagination_boundary() {
+        let (client, _server) = crate::test_utils::client::isolated_local_client().await;
+        let room_id = room_id!("!external:example.org");
+        client.event_cache().subscribe().unwrap();
+        client
+            .base_client()
+            .get_or_create_room(room_id, RoomState::Joined);
+        let (cache, _handles) = client
+            .event_cache()
+            .thread(room_id, event_id!("$root"))
+            .await
+            .unwrap();
+        let (_initial, mut subscriber) = cache.subscribe().await.unwrap();
+        let factory = EventFactory::new()
+            .room(room_id)
+            .sender(user_id!("@external:example.org"));
+        // Emulate another process replacing this cache with oversized history.
+        {
+            let guard = client.event_cache_store().lock().await.unwrap();
+            let store = guard.as_clean().unwrap();
+            let mut updates = vec![Update::Clear];
+            for index in 0..1024u64 {
+                let chunk = ChunkIdentifier::new(index);
+                let id: ruma::OwnedEventId = format!("$external-{index}").try_into().unwrap();
+                let message = factory.text_msg("external history").event_id(&id);
+                let event = message
+                    .in_thread(event_id!("$root"), event_id!("$root"))
+                    .into_event();
+                updates.push(Update::NewItemsChunk {
+                    previous: index.checked_sub(1).map(ChunkIdentifier::new),
+                    new: chunk,
+                    next: None,
+                });
+                updates.push(Update::PushItems {
+                    at: Position::new(chunk, 0),
+                    items: vec![event],
+                });
+            }
+            store
+                .handle_linked_chunk_updates(
+                    LinkedChunkId::Thread(room_id, event_id!("$root")),
+                    updates,
+                )
+                .await
+                .unwrap();
+        }
+        cache.inner.state.reload_no_preprocessing().await.unwrap();
+        let (events, _new_subscriber) = cache.subscribe().await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id().unwrap().as_str(), "$external-1023");
+        assert!(
+            !subscriber.is_empty(),
+            "reload must notify the existing UI subscriber"
+        );
+        subscriber.recv().await.unwrap();
+        assert!(
+            matches!(
+                cache.pagination().run_backwards_once(10).await,
+                Err(crate::event_cache::EventCacheError::HistoryWindowFull)
+            ),
+            "an evicted prefix is not the start of authoritative history"
+        );
+        let guard = client.event_cache_store().lock().await.unwrap();
+        let store = guard.as_clean().unwrap();
+        assert!(
+            store
+                .load_all_chunks(LinkedChunkId::Thread(room_id, event_id!("$root")))
+                .await
+                .unwrap()
+                .len()
+                <= 3
+        );
+    }
+
 }

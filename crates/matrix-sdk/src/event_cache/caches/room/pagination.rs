@@ -292,6 +292,8 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
         batch_size: u16,
         prev_token: &Option<String>,
     ) -> Result<Option<(Vec<Event>, Option<String>)>> {
+        #[cfg(feature = "hagency-bounded-history")]
+        crate::event_cache::retention::check_pagination_token(prev_token)?;
         let Some(room) = self.weak_room.get() else {
             // The client is shutting down.
             return Ok(None);

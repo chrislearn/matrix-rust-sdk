@@ -1,0 +1,56 @@
+name: Hagency SDK history regression
+
+on:
+  push:
+    branches: [chris/bounded-chat-history]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hagency-history-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: SDK library (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_HOME: ${{ github.workspace }}/cargo-home
+      INSTA_UPDATE: no
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+      - name: Verify Windows build storage
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ([IO.Path]::GetPathRoot($env:CARGO_TARGET_DIR) -ne 'D:\') { throw 'Build artifacts must stay on D drive' }
+          $env:TEMP = Join-Path $env:GITHUB_WORKSPACE 'tmp'
+          New-Item -ItemType Directory -Force $env:TEMP | Out-Null
+          "TEMP=$env:TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:TEMP" >> $env:GITHUB_ENV
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $metadata.target_directory.Replace('\', '/') -ne $env:CARGO_TARGET_DIR.Replace('\', '/')) { throw 'Unexpected Cargo target' }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hagency-sdk-history
+      - name: Original policy, unfiltered SDK library
+        run: cargo test --locked -p matrix-sdk --lib --features testing,bundled-sqlite
+      - name: Bounded policy, unfiltered SDK library
+        run: cargo test --locked -p matrix-sdk --lib --features testing,bundled-sqlite,hagency-bounded-history
+      - name: Strict bounded library lint
+        run: cargo clippy --locked --no-deps -p matrix-sdk --lib --features testing,bundled-sqlite,hagency-bounded-history -- -D warnings
+      - name: Shared linked chunk library
+        run: cargo test --locked -p matrix-sdk-common --lib
+      - name: Bounded library without default features
+        run: cargo check --locked -p matrix-sdk --no-default-features --features testing,hagency-bounded-history

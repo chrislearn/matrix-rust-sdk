@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(not(feature = "hagency-bounded-history"))]
+use matrix_sdk_base::linked_chunk::ChunkIdentifierGenerator;
+#[cfg(not(feature = "hagency-bounded-history"))]
+use crate::event_cache::persistence::load_linked_chunk_metadata;
 use std::iter::empty;
 #[cfg(not(feature = "hagency-bounded-history"))]
 use matrix_sdk_base::linked_chunk::lazy_loader;
@@ -23,7 +27,7 @@ use matrix_sdk_base::{
     deserialized_responses::{ThreadSummary, ThreadSummaryStatus},
     event_cache::{Event, Gap, store::EventCacheStoreLockGuard},
     linked_chunk::{
-        ChunkIdentifierGenerator, LinkedChunkId, OwnedLinkedChunkId, Position, Update,
+        LinkedChunkId, OwnedLinkedChunkId, Position, Update,
     },
     serde_helpers::extract_redaction_target,
     sync::Timeline,
@@ -50,7 +54,7 @@ use super::{
             deduplicator::{DeduplicationOutcome, filter_duplicate_events},
             persistence::{
                 find_event, find_event_relations, find_event_with_relations,
-                load_linked_chunk_metadata, send_updates_to_store,
+                send_updates_to_store,
             },
             states::{ReloadPreprocessing, StateLockReadGuard, StateLockWriteGuard},
         },
@@ -339,6 +343,11 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         // Attempt to load the last chunk.
         let linked_chunk_id = LinkedChunkId::Room(&self.state.room_id);
 
+        #[cfg(feature = "hagency-bounded-history")]
+        let (last_chunk, chunk_identifier_generator, full_linked_chunk_metadata) =
+            crate::event_cache::retention::load_snapshot(&self.store, linked_chunk_id).await?;
+        #[cfg(not(feature = "hagency-bounded-history"))]
+        let (last_chunk, chunk_identifier_generator, full_linked_chunk_metadata) = {
         let full_linked_chunk_metadata =
             match load_linked_chunk_metadata(&self.store, linked_chunk_id).await {
                 Ok(metas) => metas,
@@ -372,6 +381,9 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
                     (None, ChunkIdentifierGenerator::new_from_scratch())
                 }
             };
+
+            (last_chunk, chunk_identifier_generator, full_linked_chunk_metadata)
+        };
 
         debug!("unloading the linked chunk, and resetting it to its last chunk");
 

@@ -813,7 +813,7 @@ pub enum EventsOrigin {
 
 #[cfg(test)]
 mod tests {
-    use std::{ops::Not, sync::Arc, time::Duration};
+    use std::{ops::Not, sync::Arc};
 
     use assert_matches::assert_matches;
     use futures_util::FutureExt as _;
@@ -826,11 +826,10 @@ mod tests {
         JoinedRoomBuilder, SyncResponseBuilder, async_test, event_factory::EventFactory,
     };
     use ruma::{event_id, room_id, user_id};
-    use tokio::time::sleep;
 
     use super::{EventCacheError, RoomEventCacheGenericUpdate};
     use crate::test_utils::{
-        assert_event_matches_msg, client::MockClientBuilder, logged_in_client,
+        assert_event_matches_msg, logged_in_client,
     };
 
     #[async_test]
@@ -1120,12 +1119,10 @@ mod tests {
     #[cfg(not(target_family = "wasm"))]
     #[async_test]
     async fn test_no_refcycle_event_cache_tasks() {
-        let client = MockClientBuilder::new(None).build().await;
-
-        // Wait for the init tasks to die.
-        sleep(Duration::from_secs(1)).await;
+        let (client, _server) = crate::test_utils::client::isolated_local_client().await;
 
         let event_cache_weak = Arc::downgrade(&client.event_cache().inner);
+        crate::test_utils::client::wait_until(|| event_cache_weak.strong_count() == 1).await;
         assert_eq!(event_cache_weak.strong_count(), 1);
 
         {
@@ -1146,7 +1143,7 @@ mod tests {
         drop(client);
 
         // Give a bit of time for background tasks to die.
-        sleep(Duration::from_secs(1)).await;
+        crate::test_utils::client::wait_until(|| event_cache_weak.strong_count() == 0).await;
 
         // No strong counts should exist now that the Client has been dropped.
         assert_eq!(

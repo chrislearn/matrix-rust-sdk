@@ -562,10 +562,22 @@ impl Caches {
     ) -> Result<impl Iterator<Item = Event>> {
         // All caches store their events in the store except one. Let's start by looking
         // inside the store.
+        #[cfg(not(feature = "hagency-bounded-history"))]
         let mut events = {
             let state = self.internals.state.read().await?;
 
             state.store.get_room_events(self.room.room_id(), event_type, session_id).await?
+        };
+        #[cfg(feature = "hagency-bounded-history")]
+        let mut events = {
+            use matrix_sdk_base::linked_chunk::OwnedLinkedChunkId;
+            let room = self.room.room_id().to_owned();
+            // Match cache creation's threads-before-state lock order. Release
+            // the threads guard before acquiring the shared state/store lock.
+            let mut ids = vec![OwnedLinkedChunkId::Room(room.clone())];
+            ids.extend(self.threads.read().await.keys().map(|id| OwnedLinkedChunkId::Thread(room.clone(), id.clone())));
+            let state = self.internals.state.read().await?;
+            super::retention::stored_events(&state.store, &ids, event_type, session_id).await?
         };
 
         // The only cache to not store its events is the event-focused cache. Its events

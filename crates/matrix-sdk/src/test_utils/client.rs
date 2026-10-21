@@ -306,3 +306,35 @@ pub mod oauth {
         }
     }
 }
+
+/// A real local HTTP endpoint for lifetime tests. Keep the server alive until
+/// all weak-reference assertions finish; neither system proxy nor external
+/// user-domain discovery may hold initialization tasks alive.
+#[cfg(not(target_family = "wasm"))]
+pub async fn isolated_local_client() -> (Client, wiremock::MockServer) {
+    let server = wiremock::MockServer::start().await;
+    let uri = server.uri();
+    let user_id = format!("@lifetime:{}", uri.strip_prefix("http://").unwrap())
+        .try_into()
+        .unwrap();
+    let client = MockClientBuilder::new(Some(&uri))
+        .logged_in_with_token("1234".into(), user_id, "DEVICEID".into())
+        .on_builder(|builder| {
+            builder.http_client(reqwest::Client::builder().no_proxy().build().unwrap())
+        })
+        .build()
+        .await;
+    (client, server)
+}
+
+/// Observe task completion, with a bounded deadline instead of a fixed sleep.
+#[cfg(not(target_family = "wasm"))]
+pub async fn wait_until(mut predicate: impl FnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !predicate() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background operation did not finish within 5 seconds");
+}

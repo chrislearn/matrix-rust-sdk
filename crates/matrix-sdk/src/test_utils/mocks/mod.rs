@@ -62,7 +62,9 @@ use ruma::{
     serde::Raw,
     time::Duration,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(feature = "e2e-encryption")]
+use serde::Serialize;
 use serde_json::{Value, from_value, json};
 use tokio::sync::oneshot::{self, Receiver};
 use wiremock::{

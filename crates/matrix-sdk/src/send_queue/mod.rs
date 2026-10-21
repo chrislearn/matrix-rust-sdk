@@ -3222,7 +3222,7 @@ fn canonicalize_dependent_requests(
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
     use assert_matches2::{assert_let, assert_matches};
     use matrix_sdk_base::store::{
@@ -3237,7 +3237,7 @@ mod tests {
     };
 
     use super::canonicalize_dependent_requests;
-    use crate::{client::WeakClient, test_utils::logged_in_client};
+    use crate::client::WeakClient;
 
     #[test]
     fn test_canonicalize_dependent_events_created_at() {
@@ -3274,7 +3274,7 @@ mod tests {
     #[async_test]
     async fn test_client_no_cycle_with_send_queue() {
         for enabled in [true, false] {
-            let client = logged_in_client(None).await;
+            let (client, _server) = crate::test_utils::client::isolated_local_client().await;
             let weak_client = WeakClient::from_client(&client);
 
             {
@@ -3304,7 +3304,7 @@ mod tests {
             drop(client);
 
             // Give a bit of time for background tasks to die.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            crate::test_utils::client::wait_until(|| weak_client.strong_count() == 0).await;
 
             // The weak client must be the last reference to the client now.
             let client = weak_client.get();

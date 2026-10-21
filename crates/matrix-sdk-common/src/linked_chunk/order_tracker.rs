@@ -125,6 +125,19 @@ where
         let _ = self.mapper.map(updates);
     }
 
+    /// Number of ordered items and chunks, including lazily unloaded chunks.
+    /// Flush pending updates before inspecting the retained metadata budget.
+    pub fn retained_metadata_size(&mut self) -> (usize, usize) {
+        self.flush_updates(false);
+        (
+            self.mapper
+                .chunks
+                .iter()
+                .fold(0usize, |sum, (_, len)| sum.saturating_add(*len)),
+            self.mapper.chunks.len(),
+        )
+    }
+
     /// Given an event's position, returns its final ordering in the current
     /// state of the linked chunk as a vector.
     ///

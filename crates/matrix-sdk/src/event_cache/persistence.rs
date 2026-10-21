@@ -12,20 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+#[cfg(not(feature = "hagency-bounded-history"))]
+use std::collections::HashMap;
+#[cfg(not(feature = "hagency-bounded-history"))]
+use matrix_sdk_base::linked_chunk::{ChunkMetadata, LinkedChunkId};
+#[cfg(not(feature = "hagency-bounded-history"))]
+use super::EventCacheError;
 
 use matrix_sdk_base::{
     deserialized_responses::TimelineEventKind,
     event_cache::{Event, Gap, store::EventCacheStoreLockGuard},
     executor::spawn,
-    linked_chunk::{ChunkMetadata, LinkedChunkId, OwnedLinkedChunkId, Update},
+    linked_chunk::{OwnedLinkedChunkId, Update},
 };
 use ruma::{EventId, RoomId, events::relation::RelationType, serde::Raw};
 use tokio::sync::broadcast::Sender;
 use tracing::trace;
 
 use super::{
-    EventCacheError, Result,
+    Result,
     caches::{
         EventLocation, event_linked_chunk::EventLinkedChunk, room::RoomEventCacheLinkedChunkUpdate,
     },
@@ -36,6 +42,7 @@ use super::{
 ///
 /// Returns `None` if there's no such linked chunk in the store, or an
 /// error if the linked chunk is malformed.
+#[cfg(not(feature = "hagency-bounded-history"))]
 pub(super) async fn load_linked_chunk_metadata(
     store_guard: &EventCacheStoreLockGuard,
     linked_chunk_id: LinkedChunkId<'_>,

@@ -4515,12 +4515,10 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_client_no_cycle_with_event_cache() {
-        let client = MockClientBuilder::new(None).build().await;
-
-        // Wait for the init tasks to die.
-        sleep(Duration::from_secs(1)).await;
+        let (client, _server) = crate::test_utils::client::isolated_local_client().await;
 
         let weak_client = WeakClient::from_client(&client);
+        crate::test_utils::client::wait_until(|| weak_client.strong_count() == 1).await;
         assert_eq!(weak_client.strong_count(), 1);
 
         {
@@ -4530,18 +4528,27 @@ pub(crate) mod tests {
             let response = SyncResponseBuilder::default()
                 .add_joined_room(JoinedRoomBuilder::new(room_id))
                 .build_sync_response();
-            client.inner.base_client.receive_sync_response(response).await.unwrap();
+            client
+                .inner
+                .base_client
+                .receive_sync_response(response)
+                .await
+                .unwrap();
 
             client.event_cache().subscribe().unwrap();
 
-            let (_room_event_cache, _drop_handles) =
-                client.get_room(room_id).unwrap().event_cache().await.unwrap();
+            let (_room_event_cache, _drop_handles) = client
+                .get_room(room_id)
+                .unwrap()
+                .event_cache()
+                .await
+                .unwrap();
         }
 
         drop(client);
 
         // Give a bit of time for background tasks to die.
-        sleep(Duration::from_secs(1)).await;
+        crate::test_utils::client::wait_until(|| weak_client.strong_count() == 0).await;
 
         // The weak client must be the last reference to the client now.
         assert_eq!(weak_client.strong_count(), 0);
@@ -4652,7 +4659,9 @@ pub(crate) mod tests {
         let server_url = server.uri();
         let domain = server_url.strip_prefix("http://").unwrap();
         let server_name = <&ServerName>::try_from(domain).unwrap();
-        let rtc_foci = vec![RtcTransport::livekit("https://livekit.example.com".to_owned())];
+        let rtc_foci = vec![RtcTransport::livekit(
+            "https://livekit.example.com".to_owned(),
+        )];
 
         let well_known_mock = server
             .mock_well_known()
@@ -4664,6 +4673,7 @@ pub(crate) mod tests {
 
         let memory_store = Arc::new(MemoryStore::new());
         let client = Client::builder()
+            .http_client(reqwest::Client::builder().no_proxy().build().unwrap())
             .insecure_server_name_no_tls(server_name)
             .store_config(
                 StoreConfig::new(CrossProcessLockConfig::SingleProcess)
@@ -4682,12 +4692,19 @@ pub(crate) mod tests {
 
         let client = server
             .client_builder()
+            .logged_in_with_token(
+                "1234".into(),
+                format!("@cache:{domain}").try_into().unwrap(),
+                "DEVICEID".into(),
+            )
             .no_server_versions()
             .on_builder(|builder| {
-                builder.store_config(
-                    StoreConfig::new(CrossProcessLockConfig::SingleProcess)
-                        .state_store(memory_store.clone()),
-                )
+                builder
+                    .http_client(reqwest::Client::builder().no_proxy().build().unwrap())
+                    .store_config(
+                        StoreConfig::new(CrossProcessLockConfig::SingleProcess)
+                            .state_store(memory_store.clone()),
+                    )
             })
             .build()
             .await;
@@ -4703,7 +4720,13 @@ pub(crate) mod tests {
         // Now, reset the cache, and observe the endpoints being called again once.
         client.reset_well_known().await.unwrap();
 
-        server.mock_well_known().ok().named("second well known mock").expect(2).mount().await;
+        server
+            .mock_well_known()
+            .ok()
+            .named("second well known mock")
+            .expect(2)
+            .mount()
+            .await;
 
         // Hits network again.
         assert_eq!(client.well_known_rtc_transports().await.unwrap(), rtc_foci);
@@ -4722,7 +4745,7 @@ pub(crate) mod tests {
         // We wait for the task to finish, the endpoint should have been called again.
         // We need to wait a bit because the first requests using the server name of the
         // user will fail, only the requests using the homeserver URL will succeed.
-        sleep(Duration::from_secs(5)).await;
+        crate::test_utils::client::wait_until(|| matches!(client.inner.caches.well_known.value(), CachedValue::Cached(value) if !value.has_expired())).await;
         assert_matches!(client.inner.caches.well_known.value(), CachedValue::Cached(value) if !value.has_expired());
     }
 
