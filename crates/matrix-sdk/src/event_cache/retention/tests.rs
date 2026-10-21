@@ -256,3 +256,53 @@ async fn test_oversized_event_is_a_boundary_not_a_hidden_hole() {
         "never bridge over a discarded middle event"
     );
 }
+
+#[cfg(feature = "sqlite")]
+#[async_test]
+async fn test_encrypted_sqlite_reopen_and_thread_isolation() {
+    use matrix_sdk_base::store::StoreConfig;
+    use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
+    use std::sync::Arc;
+    let directory = tempfile::tempdir().unwrap();
+    let room = room_id!("!budget:example.org");
+    let thread = LinkedChunkId::Thread(room, event_id!("$thread"));
+    for round in 0..2 {
+        let sqlite = matrix_sdk_sqlite::SqliteEventCacheStore::open(
+            directory.path().to_str().unwrap(),
+            Some("isolated-budget-fixture"),
+        )
+        .await
+        .unwrap();
+        let client = crate::Client::builder()
+            .homeserver_url("http://127.0.0.1")
+            .store_config(
+                StoreConfig::new(CrossProcessLockConfig::SingleProcess)
+                    .event_cache_store(Arc::new(sqlite)),
+            )
+            .build()
+            .await
+            .unwrap();
+        let guard = client.event_cache_store().lock().await.unwrap();
+        let store = guard.as_clean().unwrap();
+        if round == 0 {
+            seed(store, thread, 2, 1, "thread persists").await;
+            seed(store, LinkedChunkId::Room(room), 4, 128, "budget boundary").await;
+            let (_, _, meta) = load_snapshot(store, LinkedChunkId::Room(room)).await.unwrap();
+            assert_eq!(meta.unwrap().iter().map(|m| m.num_items).sum::<usize>(), MAX_EVENTS);
+            seed(store, LinkedChunkId::Room(room), MAX_EVENTS + 1, 1, "trimmed suffix").await;
+        }
+        let chunk = load(store, LinkedChunkId::Room(room)).await.unwrap();
+        assert_eq!(chunk.events().count(), 1);
+        assert_eq!(
+            chunk.events().next().unwrap().1.event_id(),
+            Some(event_id!("$budget-room-512-0"))
+        );
+        assert!(store.load_all_chunks(LinkedChunkId::Room(room)).await.unwrap().len() <= 3);
+        assert_eq!(store.load_all_chunks(thread).await.unwrap().len(), 2);
+        assert!(
+            store.load_all_chunks(LinkedChunkId::Room(room)).await.unwrap().iter().any(
+                |c| matches!(&c.content, ChunkContent::Gap(gap) if gap.token == WINDOW_BOUNDARY)
+            )
+        );
+    }
+}
