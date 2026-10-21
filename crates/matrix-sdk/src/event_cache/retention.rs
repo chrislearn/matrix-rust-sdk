@@ -62,7 +62,17 @@ pub(super) async fn load(
     store: &EventCacheStoreLockGuard,
     id: LinkedChunkId<'_>,
 ) -> Result<EventLinkedChunk> {
-    let (last, _) = store.load_last_chunk(id).await?;
+    let last = match store.load_last_chunk(id).await {
+        Ok((last, _)) => last,
+        Err(error) => {
+            // This is a disposable working cache. Match the upstream recovery
+            // path for malformed/cyclic chunks without loading all metadata.
+            tracing::error!(?error, "Resetting an unreadable bounded history cache");
+            store.handle_linked_chunk_updates(id, vec![Update::Clear]).await?;
+            None
+        }
+    };
+    let had_chunk = last.is_some();
     let (gap, events) = match last.map(|c|c.content) {
         Some(ChunkContent::Items(events)) => (None, events),
         Some(ChunkContent::Gap(gap)) => (Some(gap), Vec::new()),
@@ -80,6 +90,14 @@ pub(super) async fn load(
         store.clear_all_events(Some(room)).await?;
     }
     let mut chunk = EventLinkedChunk::new();
+    if gap.is_none() && events.is_empty() {
+        if had_chunk && !matches!(id, LinkedChunkId::Room(_)) {
+            store.handle_linked_chunk_updates(id, vec![Update::Clear]).await?;
+        }
+        // Preserve the new chunk's pending store updates for the first real
+        // event. Creating an empty cache must not wait on a persistence write.
+        return Ok(chunk);
+    }
     chunk.push_live_events(gap, &events);
     let mut updates = vec![Update::Clear];
     updates.extend(chunk.store_updates().take());
