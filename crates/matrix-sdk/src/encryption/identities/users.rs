@@ -366,6 +366,30 @@ impl UserIdentity {
         Ok(())
     }
 
+    /// Sign another user's already reviewed identity with an additional host
+    /// request fence. Does not mark our own identity verified, refresh credentials,
+    /// or establish application execution permission. Callers must compare the
+    /// exact master/device fingerprints before calling and observe fresh identity
+    /// state afterwards; a signature upload receipt alone is not verification.
+    pub async fn verify_with_request_fence(
+        &self,
+        fence: std::sync::Arc<crate::HttpRequestFence>,
+    ) -> Result<(), ManualVerifyError> {
+        let _original = fence.begin_request()?;
+        let request = match &self.inner {
+            CryptoUserIdentity::Other(identity) => identity.verify().await?,
+            CryptoUserIdentity::Own(_) => {
+                return Err(matrix_sdk_base::crypto::SignatureError::UserIdMismatch.into());
+            }
+        };
+        self.client
+            .send(request)
+            .with_request_config(crate::config::RequestConfig::new().disable_retry())
+            .with_request_fence(fence)
+            .await?;
+        Ok(())
+    }
+
     /// Is the user identity considered to be verified.
     ///
     /// A user identity is considered to be verified if:

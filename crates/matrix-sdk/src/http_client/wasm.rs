@@ -35,6 +35,7 @@ impl HttpClient {
     {
         tracing::debug!("Sending request");
         let _permit = self.request_fence.as_ref().map(|f| f.begin_request()).transpose()?;
+        let _scope = self.request_scope.as_ref().map(|f| f.begin_request()).transpose()?;
 
         let request = reqwest::Request::try_from(request)?;
 

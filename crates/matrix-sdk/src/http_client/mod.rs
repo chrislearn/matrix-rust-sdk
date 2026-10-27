@@ -77,6 +77,7 @@ impl MaybeSemaphore {
 #[derive(Clone, Debug)]
 pub(crate) struct HttpClient {
     pub(crate) request_fence: Option<Arc<crate::HttpRequestFence>>,
+    pub(crate) request_scope: Option<Arc<crate::HttpRequestFence>>,
     pub(crate) inner: reqwest::Client,
     pub(crate) request_config: RequestConfig,
     concurrent_request_semaphore: MaybeSemaphore,
@@ -87,6 +88,7 @@ impl HttpClient {
     pub(crate) fn new(inner: reqwest::Client, request_config: RequestConfig) -> Self {
         HttpClient {
             request_fence: None,
+            request_scope: None,
             inner,
             request_config,
             concurrent_request_semaphore: MaybeSemaphore::new(

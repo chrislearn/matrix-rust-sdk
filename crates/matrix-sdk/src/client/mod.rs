@@ -663,7 +663,12 @@ impl Client {
         use ruma::api::federation::discovery::get_server_version;
 
         let res = self
-            .send_inner(get_server_version::v1::Request::new(), request_config, Default::default())
+            .send_inner(
+                get_server_version::v1::Request::new(),
+                request_config,
+                Default::default(),
+                None,
+            )
             .await?;
 
         // Extract server info, using defaults if fields are missing.
@@ -2103,6 +2108,7 @@ impl Client {
             client: self.clone(),
             request,
             config: None,
+            request_fence: None,
             send_progress: Default::default(),
         }
     }
@@ -2112,6 +2118,7 @@ impl Client {
         request: Request,
         config: Option<RequestConfig>,
         send_progress: SharedObservable<TransmissionProgress>,
+        request_fence: Option<Arc<crate::HttpRequestFence>>,
     ) -> HttpResult<Request::IncomingResponse>
     where
         Request: OutgoingRequest + Debug,
@@ -2127,9 +2134,9 @@ impl Client {
         let path_builder_input =
             Request::PathBuilder::get_path_builder_input(self, skip_auth).await?;
 
-        let result = self
-            .inner
-            .http_client
+        let mut http = self.inner.http_client.clone();
+        http.request_scope = request_fence;
+        let result = http
             .send(
                 request,
                 config,
@@ -4528,21 +4535,12 @@ pub(crate) mod tests {
             let response = SyncResponseBuilder::default()
                 .add_joined_room(JoinedRoomBuilder::new(room_id))
                 .build_sync_response();
-            client
-                .inner
-                .base_client
-                .receive_sync_response(response)
-                .await
-                .unwrap();
+            client.inner.base_client.receive_sync_response(response).await.unwrap();
 
             client.event_cache().subscribe().unwrap();
 
-            let (_room_event_cache, _drop_handles) = client
-                .get_room(room_id)
-                .unwrap()
-                .event_cache()
-                .await
-                .unwrap();
+            let (_room_event_cache, _drop_handles) =
+                client.get_room(room_id).unwrap().event_cache().await.unwrap();
         }
 
         drop(client);
@@ -4659,9 +4657,7 @@ pub(crate) mod tests {
         let server_url = server.uri();
         let domain = server_url.strip_prefix("http://").unwrap();
         let server_name = <&ServerName>::try_from(domain).unwrap();
-        let rtc_foci = vec![RtcTransport::livekit(
-            "https://livekit.example.com".to_owned(),
-        )];
+        let rtc_foci = vec![RtcTransport::livekit("https://livekit.example.com".to_owned())];
 
         let well_known_mock = server
             .mock_well_known()
@@ -4720,13 +4716,7 @@ pub(crate) mod tests {
         // Now, reset the cache, and observe the endpoints being called again once.
         client.reset_well_known().await.unwrap();
 
-        server
-            .mock_well_known()
-            .ok()
-            .named("second well known mock")
-            .expect(2)
-            .mount()
-            .await;
+        server.mock_well_known().ok().named("second well known mock").expect(2).mount().await;
 
         // Hits network again.
         assert_eq!(client.well_known_rtc_transports().await.unwrap(), rtc_foci);
@@ -5509,6 +5499,7 @@ pub(crate) mod tests {
             client: client.clone(),
             request: upload_request,
             config: None,
+            request_fence: None,
             send_progress: SharedObservable::new(TransmissionProgress::default()),
         };
         let media_request = SendMediaUploadRequest::new(request);

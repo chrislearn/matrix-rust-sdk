@@ -122,3 +122,138 @@ async fn queued_request_rechecks_fence_and_drain_keeps_original_response() {
     assert!(matches!(queued.await, Err(HttpError::RequestFenceClosed)));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn scoped_request_fence_cannot_bypass_client_fence_or_affect_ordinary_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v3/publicRooms"))
+        .respond_with(response())
+        .expect(1)
+        .mount(&server)
+        .await;
+    let global = Arc::new(HttpRequestFence::new(|| true));
+    let sdk = client(&server, global.clone(), RequestConfig::new().disable_retry()).await;
+    let closed = Arc::new(HttpRequestFence::new(|| false));
+    assert!(matches!(
+        sdk.send(get_public_rooms::v3::Request::new()).with_request_fence(closed).await,
+        Err(HttpError::RequestFenceClosed)
+    ));
+    sdk.send(get_public_rooms::v3::Request::new()).await.unwrap();
+    global.retire();
+    let live = Arc::new(HttpRequestFence::new(|| true));
+    assert!(matches!(
+        sdk.send(get_public_rooms::v3::Request::new()).with_request_fence(live).await,
+        Err(HttpError::RequestFenceClosed)
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+#[tokio::test]
+async fn scoped_request_fence_rechecks_real_queue_and_preserves_original_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v3/publicRooms"))
+        .respond_with(response().set_delay(Duration::from_millis(150)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let sdk = client(
+        &server,
+        Arc::new(HttpRequestFence::new(|| true)),
+        RequestConfig::new().disable_retry().max_concurrent_requests(NonZeroUsize::new(1)),
+    )
+    .await;
+    let first = Arc::new(HttpRequestFence::new(|| true));
+    let original = sdk.clone();
+    let scope = first.clone();
+    let original = tokio::spawn(async move {
+        original.send(get_public_rooms::v3::Request::new()).with_request_fence(scope).await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.received_requests().await.unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let queued = Arc::new(HttpRequestFence::new(|| true));
+    let mut next = Box::pin(async {
+        sdk.send(get_public_rooms::v3::Request::new()).with_request_fence(queued.clone()).await
+    });
+    assert!(futures_util::poll!(&mut next).is_pending());
+    queued.retire();
+    let mut drain = Box::pin(first.retire_and_drain());
+    assert!(futures_util::poll!(&mut drain).is_pending());
+    original.await.unwrap().unwrap();
+    drain.await.unwrap();
+    assert!(matches!(next.await, Err(HttpError::RequestFenceClosed)));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+#[tokio::test]
+async fn scoped_request_fence_retirement_after_actual_attempt_refuses_retry() {
+    let server = MockServer::start().await;
+    let scope = Arc::new(HttpRequestFence::new(|| true));
+    let retire = scope.clone();
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v3/publicRooms"))
+        .respond_with(move |_: &wiremock::Request| {
+            retire.retire();
+            ResponseTemplate::new(503)
+                .set_body_json(json!({"errcode":"M_UNKNOWN","error":"original failure"}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let sdk = client(
+        &server,
+        Arc::new(HttpRequestFence::new(|| true)),
+        RequestConfig::new().retry_limit(3),
+    )
+    .await;
+    assert!(matches!(
+        sdk.send(get_public_rooms::v3::Request::new()).with_request_fence(scope.clone()).await,
+        Err(HttpError::RequestFenceClosed)
+    ));
+    scope.retire_and_drain().await.unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn scoped_request_fence_unknown_token_cannot_start_automatic_refresh() {
+    use matrix_sdk::{SessionMeta, SessionTokens, authentication::matrix::MatrixSession};
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/_matrix/client/v3/publicRooms")).respond_with(ResponseTemplate::new(401).set_body_json(json!({"errcode":"M_UNKNOWN_TOKEN","error":"original token refused","soft_logout":false}))).expect(1).mount(&server).await;
+    let sdk = Client::builder()
+        .homeserver_url(server.uri())
+        .server_versions([MatrixVersion::V1_15])
+        .request_config(RequestConfig::new().disable_retry())
+        .handle_refresh_tokens()
+        .build()
+        .await
+        .unwrap();
+    sdk.matrix_auth()
+        .restore_session(
+            MatrixSession {
+                meta: SessionMeta {
+                    user_id: ruma::user_id!("@scope:test").to_owned(),
+                    device_id: ruma::device_id!("SCOPED").to_owned(),
+                },
+                tokens: SessionTokens {
+                    access_token: "test-access".into(),
+                    refresh_token: Some("test-refresh".into()),
+                },
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        sdk.send(get_public_rooms::v3::Request::new())
+            .with_request_fence(Arc::new(HttpRequestFence::new(|| true)))
+            .await
+            .is_err()
+    );
+    let received = server.received_requests().await.unwrap();
+    assert!(received.iter().all(|r| !r.url.path().ends_with("/refresh")));
+    assert_eq!(received.iter().filter(|r| r.url.path().ends_with("/publicRooms")).count(), 1);
+}

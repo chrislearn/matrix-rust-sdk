@@ -1405,6 +1405,32 @@ impl Encryption {
         Ok(identity.map(|i| UserIdentity::new(self.client.clone(), i)))
     }
 
+    /// Fetch fresh public identity and device keys under an additional host
+    /// request fence, with retries and automatic credential refresh disabled.
+    /// This updates the normal crypto store; it never marks identities verified.
+    pub async fn request_user_identity_with_fence(
+        &self,
+        user_id: &UserId,
+        fence: Arc<crate::HttpRequestFence>,
+    ) -> Result<Option<UserIdentity>> {
+        let olm = self.client.olm_machine().await;
+        let Some(olm) = olm.as_ref() else { return Ok(None) };
+        let (id, request) = olm.query_keys_for_users(iter::once(user_id));
+        let request = assign!(get_keys::v3::Request::new(), { device_keys: request.device_keys });
+        let response = self
+            .client
+            .send(request)
+            .with_request_config(crate::config::RequestConfig::new().disable_retry())
+            .with_request_fence(fence)
+            .await?;
+        self.client.mark_request_as_sent(&id, &response).await?;
+        self.update_state_after_keys_query(&response).await;
+        Ok(olm
+            .get_identity(user_id, None)
+            .await?
+            .map(|i| UserIdentity::new(self.client.clone(), i)))
+    }
+
     /// Returns a stream of device updates, allowing users to listen for
     /// notifications about new or changed devices.
     ///
@@ -2357,7 +2383,12 @@ impl Encryption {
 
             let send_result = self
                 .client
-                .send_inner(ruma_request, Some(RequestConfig::short_retry()), Default::default())
+                .send_inner(
+                    ruma_request,
+                    Some(RequestConfig::short_retry()),
+                    Default::default(),
+                    None,
+                )
                 .await;
 
             // If the sending failed we need to collect the failures to report them
