@@ -133,7 +133,6 @@ pub use matrix_sdk_base::crypto::{
 };
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 
-#[cfg(feature = "experimental-send-custom-to-device")]
 use crate::config::RequestConfig;
 pub use crate::error::RoomKeyImportError;
 
@@ -1407,12 +1406,33 @@ impl Encryption {
 
     /// Fetch fresh public identity and device keys under an additional host
     /// request fence, with retries and automatic credential refresh disabled.
-    /// This updates the normal crypto store; it never marks identities verified.
+    /// Requires a complete successful response and its exact device. Missing or
+    /// invalid current keys/signatures cannot fall back to a locally verified
+    /// cache entry. This updates the normal crypto store; it never marks an
+    /// identity verified. Absence of the current master key returns `None`.
     pub async fn request_user_identity_with_fence(
         &self,
         user_id: &UserId,
+        expected_device: &DeviceId,
         fence: Arc<crate::HttpRequestFence>,
     ) -> Result<Option<UserIdentity>> {
+        fn same<T: serde::Serialize + serde::de::DeserializeOwned>(
+            cached: &T,
+            wire: &impl serde::Serialize,
+        ) -> Result<bool> {
+            let observed: T = serde_json::from_value(serde_json::to_value(wire)?)
+                .map_err(|_| Error::InsufficientData)?;
+            let mut cached = serde_json::to_value(cached)?;
+            let mut observed = serde_json::to_value(observed)?;
+            // Display names and other unsigned annotations are not key evidence.
+            if let Some(value) = cached.as_object_mut() {
+                value.remove("unsigned");
+            }
+            if let Some(value) = observed.as_object_mut() {
+                value.remove("unsigned");
+            }
+            Ok(cached == observed)
+        }
         let olm = self.client.olm_machine().await;
         let Some(olm) = olm.as_ref() else { return Ok(None) };
         let (id, request) = olm.query_keys_for_users(iter::once(user_id));
@@ -1420,15 +1440,44 @@ impl Encryption {
         let response = self
             .client
             .send(request)
-            .with_request_config(crate::config::RequestConfig::new().disable_retry())
+            .with_request_config(RequestConfig::new().disable_retry())
             .with_request_fence(fence)
             .await?;
+        if !response.failures.is_empty() {
+            return Err(Error::InsufficientData);
+        }
+        // A successful partial response must never turn an old cached identity
+        // into a fresh trust observation. Require this response's exact device,
+        // and compare all cross-signing keys AND signatures with validated data.
+        let Some(master) = response.master_keys.get(user_id) else { return Ok(None) };
+        let signing = response.self_signing_keys.get(user_id).ok_or(Error::InsufficientData)?;
+        let wire_device = response
+            .device_keys
+            .get(user_id)
+            .and_then(|d| d.get(expected_device))
+            .ok_or(Error::InsufficientData)?;
         self.client.mark_request_as_sent(&id, &response).await?;
         self.update_state_after_keys_query(&response).await;
-        Ok(olm
-            .get_identity(user_id, None)
-            .await?
-            .map(|i| UserIdentity::new(self.client.clone(), i)))
+        let identity = olm.get_identity(user_id, None).await?.ok_or(Error::InsufficientData)?;
+        let matches = match &identity {
+            matrix_sdk_base::crypto::UserIdentity::Own(own) => {
+                same(own.master_key(), master)?
+                    && same(own.self_signing_key(), signing)?
+                    && same(
+                        own.user_signing_key(),
+                        response.user_signing_keys.get(user_id).ok_or(Error::InsufficientData)?,
+                    )?
+            }
+            matrix_sdk_base::crypto::UserIdentity::Other(other) => {
+                same(other.master_key(), master)? && same(other.self_signing_key(), signing)?
+            }
+        };
+        let device =
+            olm.get_device(user_id, expected_device, None).await?.ok_or(Error::InsufficientData)?;
+        if !matches || !same(device.as_device_keys(), wire_device)? {
+            return Err(Error::InsufficientData);
+        }
+        Ok(Some(UserIdentity::new(self.client.clone(), identity)))
     }
 
     /// Returns a stream of device updates, allowing users to listen for

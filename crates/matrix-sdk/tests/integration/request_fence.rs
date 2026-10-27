@@ -257,3 +257,96 @@ async fn scoped_request_fence_unknown_token_cannot_start_automatic_refresh() {
     assert!(received.iter().all(|r| !r.url.path().ends_with("/refresh")));
     assert_eq!(received.iter().filter(|r| r.url.path().ends_with("/publicRooms")).count(), 1);
 }
+
+#[cfg(feature = "e2e-encryption")]
+#[tokio::test]
+async fn scoped_identity_response_cannot_substitute_old_verified_cache_for_missing_or_invalid_keys()
+{
+    use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    use std::sync::atomic::AtomicUsize;
+    let server = MatrixMockServer::new().await;
+    server.mock_crypto_endpoints_preset().await;
+    let sdk = server
+        .client_builder_for_crypto_end_to_end(
+            ruma::user_id!("@owner:test"),
+            ruma::device_id!("HOST"),
+        )
+        .build()
+        .await;
+    sdk.encryption().bootstrap_cross_signing(None).await.unwrap();
+    server.mock_sync().ok_and_run(&sdk, |_| {}).await;
+    let user = sdk.user_id().unwrap();
+    let device = sdk.device_id().unwrap();
+    assert!(sdk.encryption().request_user_identity(user).await.unwrap().unwrap().is_verified());
+    let valid: serde_json::Value = serde_json::from_slice(
+        &sdk.http_client()
+            .post(format!("{}/_matrix/client/v3/keys/query", server.uri()))
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&json!({"device_keys":{user:[]}})).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let mode = Arc::new(AtomicUsize::new(0));
+    let setting = mode.clone();
+    let owner = user.to_string();
+    let id = device.to_string();
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/keys/query"))
+        .respond_with(move |_: &wiremock::Request| {
+            let mut body = valid.clone();
+            match setting.load(Ordering::Acquire) {
+                1 => {
+                    body["failures"] =
+                        json!({"test":{"errcode":"M_UNAVAILABLE","error":"partial query"}})
+                }
+                2 => {
+                    body["master_keys"].as_object_mut().unwrap().remove(&owner);
+                }
+                3 => {
+                    body["self_signing_keys"].as_object_mut().unwrap().remove(&owner);
+                }
+                4 => {
+                    body["user_signing_keys"].as_object_mut().unwrap().remove(&owner);
+                }
+                5 => {
+                    body["device_keys"][&owner].as_object_mut().unwrap().remove(&id);
+                }
+                6 => body["self_signing_keys"][&owner]["signatures"] = json!({}),
+                7 => {
+                    body["device_keys"][&owner][&id]["keys"][format!("ed25519:{id}")] =
+                        json!("A".repeat(43))
+                }
+                _ => {}
+            }
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .with_priority(1)
+        .mount(server.server())
+        .await;
+    let encryption = sdk.encryption();
+    let query = || {
+        encryption.request_user_identity_with_fence(
+            user,
+            device,
+            Arc::new(HttpRequestFence::new(|| true)),
+        )
+    };
+    assert!(query().await.unwrap().unwrap().is_verified());
+    for value in 1..=7 {
+        mode.store(value, Ordering::Release);
+        let result = query().await;
+        if value == 2 {
+            assert!(result.unwrap().is_none());
+        } else {
+            assert!(result.is_err(), "incomplete response mode {value} accepted");
+        }
+        // The old locally verified root still exists. Its latch is deliberately
+        // insufficient to accept any of the above as a fresh trust observation.
+        assert!(sdk.encryption().get_user_identity(user).await.unwrap().unwrap().is_verified());
+    }
+}
