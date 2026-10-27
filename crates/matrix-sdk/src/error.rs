@@ -261,6 +261,10 @@ pub enum Error {
     #[error("Local cache doesn't contain all necessary data to perform the action.")]
     InsufficientData,
 
+    /// The caller required encryption but the event cannot be encrypted.
+    #[error("Encryption is required for this event")]
+    EncryptionRequired,
+
     /// Attempting to restore a session after the olm-machine has already been
     /// set up fails
     #[cfg(feature = "e2e-encryption")]

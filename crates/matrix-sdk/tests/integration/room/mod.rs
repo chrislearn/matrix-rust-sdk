@@ -10,3 +10,4 @@ mod pinned_events;
 mod spaces;
 mod tags;
 mod thread;
+mod required_encryption;
