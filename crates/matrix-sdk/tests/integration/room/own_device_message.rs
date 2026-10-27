@@ -72,7 +72,7 @@ async fn test_own_device_seal_uses_detached_key_and_excludes_foreign_and_unsigne
         .unwrap();
     let room_id = room_id!("!private:test");
     let f = EventFactory::new().room(room_id).sender(owner);
-    for client in [&host, &remote, &unsigned, &foreign] {
+    for client in [&host, &unsigned, &foreign] {
         server
             .mock_sync()
             .ok_and_run(client, |b| {
@@ -128,24 +128,33 @@ async fn test_own_device_seal_uses_detached_key_and_excludes_foreign_and_unsigne
         assert!(devices.contains_key(remote.device_id().unwrap()));
     }
     server.sync_back_pending_to_device_messages(queue.clone(), &remote).await;
+    assert!(remote.get_room(room_id).is_none(), "receiver has no room history/cache");
+    let before = server.server().received_requests().await.unwrap().len();
     let decrypted = remote
-        .get_room(room_id)
-        .unwrap()
-        .decrypt_event(&ruma::serde::Raw::from_json(raw.json().to_owned()), None)
+        .encryption()
+        .decrypt_received_room_event(room_id, &ruma::serde::Raw::from_json(raw.json().to_owned()))
         .await
         .unwrap();
+    assert_eq!(server.server().received_requests().await.unwrap().len(), before);
     let clear: Value = serde_json::from_str(decrypted.raw().json().get()).unwrap();
     assert_eq!(clear["content"]["body"], "private proposal");
     for client in [&unsigned, &foreign] {
-        let event = client
-            .get_room(room_id)
-            .unwrap()
-            .decrypt_event(&ruma::serde::Raw::from_json(raw.json().to_owned()), None)
-            .await
-            .unwrap();
+        let before = server.server().received_requests().await.unwrap().len();
         assert!(
-            event.encryption_info().is_none(),
+            client
+                .encryption()
+                .decrypt_received_room_event(
+                    room_id,
+                    &ruma::serde::Raw::from_json(raw.json().to_owned())
+                )
+                .await
+                .is_err(),
             "old broad session cannot decrypt the detached message"
+        );
+        assert_eq!(
+            server.server().received_requests().await.unwrap().len(),
+            before,
+            "missing keys cannot start history/backup recovery"
         );
     }
     let (normal_rx, normal_mock) =

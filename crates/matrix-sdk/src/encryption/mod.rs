@@ -1480,6 +1480,31 @@ impl Encryption {
         Ok(Some(UserIdentity::new(self.client.clone(), identity)))
     }
 
+    /// Decrypt one already received encrypted event using only the original
+    /// local crypto store. Does not require a Room cache, fetch history, import
+    /// keys or start backup/key recovery. Missing keys are an explicit error.
+    /// Callers must bind the original transport event/room and enforce current
+    /// sender, membership, lease and execution authority independently.
+    pub async fn decrypt_received_room_event(
+        &self,
+        room: &ruma::RoomId,
+        event: &ruma::serde::Raw<ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent>,
+    ) -> Result<crate::deserialized_responses::TimelineEvent> {
+        let machine = self.client.olm_machine().await;
+        let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        match machine
+            .try_decrypt_room_event(event.cast_ref(), room, self.client.decryption_settings())
+            .await?
+        {
+            matrix_sdk_base::crypto::RoomEventDecryptionResult::Decrypted(event) => {
+                Ok(crate::deserialized_responses::TimelineEvent::from_decrypted(event, None))
+            }
+            matrix_sdk_base::crypto::RoomEventDecryptionResult::UnableToDecrypt(_) => {
+                Err(Error::InsufficientData)
+            }
+        }
+    }
+
     /// Returns a stream of device updates, allowing users to listen for
     /// notifications about new or changed devices.
     ///
