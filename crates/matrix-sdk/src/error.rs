@@ -64,6 +64,9 @@ pub type RumaApiError = UiaaResponse;
 /// converting the raw HTTP response into a Matrix response.
 #[derive(Error, Debug)]
 pub enum HttpError {
+    /// The host retired or expired this request's authority before HTTP IO.
+    #[error("host HTTP request authority is unavailable")]
+    RequestFenceClosed,
     /// Error at the HTTP layer.
     #[error(transparent)]
     Reqwest(#[from] ReqwestError),

@@ -126,6 +126,7 @@ pub struct ClientBuilder {
     well_known_lookup_disabled: bool,
     server_versions: Option<BTreeSet<MatrixVersion>>,
     handle_refresh_tokens: bool,
+    request_fence: Option<Arc<crate::HttpRequestFence>>,
     base_client: Option<BaseClient>,
     #[cfg(feature = "e2e-encryption")]
     encryption_settings: EncryptionSettings,
@@ -166,6 +167,7 @@ impl ClientBuilder {
             well_known_lookup_disabled: false,
             server_versions: None,
             handle_refresh_tokens: false,
+            request_fence: None,
             base_client: None,
             #[cfg(feature = "e2e-encryption")]
             encryption_settings: Default::default(),
@@ -495,6 +497,12 @@ impl ClientBuilder {
         self.http_cfg = Some(HttpConfig::Custom(client));
         self
     }
+    /// Require current host authority before every HTTP attempt and allow the
+    /// host to retire and drain already admitted requests. Disabled by default.
+    pub fn request_fence(mut self, fence: Arc<crate::HttpRequestFence>) -> Self {
+        self.request_fence = Some(fence);
+        self
+    }
 
     /// Specify the Matrix versions supported by the homeserver manually, rather
     /// than `build()` doing it using a `get_supported_versions` request.
@@ -693,7 +701,8 @@ impl ClientBuilder {
             client
         };
 
-        let http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
+        let mut http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
+        http_client.request_fence = self.request_fence;
 
         #[allow(unused_variables)]
         let HomeserverDiscoveryResult { server, homeserver, supported_versions, well_known } =

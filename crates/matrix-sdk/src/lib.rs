@@ -44,6 +44,8 @@ mod error;
 pub mod event_cache;
 pub mod event_handler;
 mod http_client;
+mod request_fence;
+pub use request_fence::{HttpRequestFence, HttpRequestPermit};
 pub mod latest_events;
 pub mod media;
 pub mod notification_settings;

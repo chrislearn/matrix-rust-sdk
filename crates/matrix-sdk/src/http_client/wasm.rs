@@ -34,6 +34,7 @@ impl HttpClient {
         HttpError: From<FromHttpResponseError<R::EndpointError>>,
     {
         tracing::debug!("Sending request");
+        let _permit = self.request_fence.as_ref().map(|f| f.begin_request()).transpose()?;
 
         let request = reqwest::Request::try_from(request)?;
 

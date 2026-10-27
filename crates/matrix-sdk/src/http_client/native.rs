@@ -144,6 +144,8 @@ impl HttpClient {
         let send_request = || {
             let send_progress = send_progress.clone();
             async {
+                // After semaphore waits and on EVERY retry, before transport IO.
+                let _permit = self.request_fence.as_ref().map(|f| f.begin_request()).transpose()?;
                 let response = send_request_inner(
                     &self.inner,
                     &request,
