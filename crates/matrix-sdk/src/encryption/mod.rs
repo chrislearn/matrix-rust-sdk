@@ -1490,10 +1490,24 @@ impl Encryption {
         room: &ruma::RoomId,
         event: &ruma::serde::Raw<ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent>,
     ) -> Result<crate::deserialized_responses::TimelineEvent> {
+        // The ordinary timeline merges an unencrypted outer relation when the
+        // plaintext has none. Host task routing must see authenticated content
+        // only; keep genuine inner relations but never import that fallback.
+        let mut original: serde_json::Value = serde_json::from_str(event.json().get())?;
+        if let Some(content) = original.get_mut("content").and_then(|c| c.as_object_mut()) {
+            content.remove("m.relates_to");
+        }
+        let authenticated = ruma::serde::Raw::<
+            ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent,
+        >::from_json(serde_json::value::to_raw_value(&original)?);
         let machine = self.client.olm_machine().await;
         let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
         match machine
-            .try_decrypt_room_event(event.cast_ref(), room, self.client.decryption_settings())
+            .try_decrypt_room_event(
+                authenticated.cast_ref(),
+                room,
+                self.client.decryption_settings(),
+            )
             .await?
         {
             matrix_sdk_base::crypto::RoomEventDecryptionResult::Decrypted(event) => {

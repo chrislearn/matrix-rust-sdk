@@ -107,7 +107,7 @@ async fn test_own_device_seal_uses_detached_key_and_excludes_foreign_and_unsigne
     let sealed = room
         .seal_for_own_devices(
             "m.room.message",
-            json!({"msgtype":"m.text","body":"private proposal"}),
+            json!({"msgtype":"m.text","body":"private proposal","m.relates_to":{"rel_type":"m.thread","event_id":"$authenticated-inner","is_falling_back":false}}),
         )
         .await
         .unwrap();
@@ -138,6 +138,35 @@ async fn test_own_device_seal_uses_detached_key_and_excludes_foreign_and_unsigne
     assert_eq!(server.server().received_requests().await.unwrap().len(), before);
     let clear: Value = serde_json::from_str(decrypted.raw().json().get()).unwrap();
     assert_eq!(clear["content"]["body"], "private proposal");
+    assert_eq!(clear["content"]["m.relates_to"]["event_id"], "$authenticated-inner");
+    let mut injected: Value = serde_json::from_str(raw.json().get()).unwrap();
+    injected["content"]["m.relates_to"] =
+        json!({"rel_type":"m.thread","event_id":"$forged-outer","is_falling_back":false});
+    let authenticated = remote
+        .encryption()
+        .decrypt_received_room_event(
+            room_id,
+            &ruma::serde::Raw::from_json(serde_json::value::to_raw_value(&injected).unwrap()),
+        )
+        .await
+        .unwrap();
+    let inner: Value = serde_json::from_str(authenticated.raw().json().get()).unwrap();
+    assert_eq!(inner["content"]["m.relates_to"]["event_id"], "$authenticated-inner");
+    let mut fallback: Value = serde_json::from_str(old.json().get()).unwrap();
+    fallback["content"]["m.relates_to"] =
+        json!({"rel_type":"m.thread","event_id":"$forged-outer","is_falling_back":false});
+    let no_fallback = remote
+        .encryption()
+        .decrypt_received_room_event(
+            room_id,
+            &ruma::serde::Raw::from_json(serde_json::value::to_raw_value(&fallback).unwrap()),
+        )
+        .await
+        .unwrap();
+    let no_fallback: Value = serde_json::from_str(no_fallback.raw().json().get()).unwrap();
+    assert!(no_fallback["content"].get("m.relates_to").is_none());
+    assert_eq!(server.server().received_requests().await.unwrap().len(), before);
+
     for client in [&unsigned, &foreign] {
         let before = server.server().received_requests().await.unwrap().len();
         assert!(
