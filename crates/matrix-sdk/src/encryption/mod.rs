@@ -1259,6 +1259,32 @@ impl Encryption {
         Ok(device.map(|d| Device { inner: d, client: self.client.clone() }))
     }
 
+    /// Seal one application reply for a freshly queried verified recipient.
+    /// Claims one-time keys but sends no session keys or message. The caller
+    /// must retain the original payload and enforce current room/send authority.
+    pub async fn seal_received_conversation_reply(
+        &self,
+        room: &ruma::RoomId,
+        recipient: &UserId,
+        content: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let identity =
+            self.request_user_identity(recipient).await?.ok_or(Error::InsufficientData)?;
+        if !identity.is_verified() {
+            return Err(Error::InsufficientData);
+        }
+        let _guard = self.spin_lock_store(Some(60000)).await?;
+        self.client.claim_one_time_keys(iter::once(recipient)).await?;
+        let machine = self.client.olm_machine().await;
+        let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        let raw = ruma::serde::Raw::from_json_string(serde_json::to_string(&content)?)?;
+        let (sealed, shares) = machine
+            .seal_room_event_for_verified_user(room, "m.room.message", &raw, recipient)
+            .await?;
+        let shares = shares.into_iter().map(|s| serde_json::json!({"eventType":s.event_type,"txnId":s.txn_id,"messages":s.messages})).collect::<Vec<_>>();
+        Ok(serde_json::json!({"content":sealed.content,"shares":shares}))
+    }
+
     /// A convenience method to retrieve your own device from the store.
     ///
     /// This is the same as calling [`Encryption::get_device()`] with your own

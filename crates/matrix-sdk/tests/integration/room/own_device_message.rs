@@ -272,3 +272,99 @@ async fn test_own_device_seal_refuses_without_cross_signed_remote_recipients() {
         assert!(!request.url.path().contains("/sendToDevice/"));
     }
 }
+
+#[async_test]
+async fn test_received_conversation_reply_is_roomless_and_only_for_verified_recipient() {
+    let server = MatrixMockServer::new().await;
+    server.mock_crypto_endpoints_preset().await;
+    let sender = host(&server).await;
+    let recipient = server
+        .client_builder_for_crypto_end_to_end(user_id!("@recipient:test"), device_id!("RECIPIENT"))
+        .build()
+        .await;
+    recipient.encryption().bootstrap_cross_signing(None).await.unwrap();
+    server.mock_sync().ok_and_run(&recipient, |_| {}).await;
+    server.exchange_e2ee_identities(&sender, &recipient).await;
+    let room = room_id!("!no-cache:test");
+    assert!(sender.get_room(room).is_none());
+    assert!(recipient.get_room(room).is_none());
+    assert!(
+        sender
+            .encryption()
+            .seal_received_conversation_reply(
+                room,
+                recipient.user_id().unwrap(),
+                json!({"msgtype":"m.text","body":"private original"})
+            )
+            .await
+            .is_err()
+    );
+    sender
+        .encryption()
+        .request_user_identity(recipient.user_id().unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .verify()
+        .await
+        .unwrap();
+    let before = server.server().received_requests().await.unwrap().len();
+    let sealed = sender
+        .encryption()
+        .seal_received_conversation_reply(
+            room,
+            recipient.user_id().unwrap(),
+            json!({"msgtype":"m.text","body":"private original"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sealed["content"]["algorithm"], "m.megolm.v1.aes-sha2");
+    for share in sealed["shares"].as_array().unwrap() {
+        let users = share["messages"].as_object().unwrap();
+        assert_eq!(users.len(), 1);
+        assert!(users.contains_key(recipient.user_id().unwrap().as_str()));
+    }
+    let requests = server.server().received_requests().await.unwrap();
+    assert!(
+        requests[before..]
+            .iter()
+            .all(|r| !r.url.path().contains("/send/") && !r.url.path().contains("/sendToDevice/"))
+    );
+    let queue = Arc::new(Mutex::new(Default::default()));
+    let _capture =
+        server.capture_put_to_device_traffic(sender.user_id().unwrap(), queue.clone()).await;
+    for share in sealed["shares"].as_array().unwrap() {
+        let request = ruma::api::client::to_device::send_event_to_device::v3::Request::new_raw(
+            "m.room.encrypted".into(),
+            TransactionId::new(),
+            serde_json::from_value(share["messages"].clone()).unwrap(),
+        );
+        sender.send(request).await.unwrap();
+    }
+    server.sync_back_pending_to_device_messages(queue, &recipient).await;
+    let raw=ruma::serde::Raw::from_json_string(json!({"type":"m.room.encrypted","sender":sender.user_id(),"event_id":"$original-reply","origin_server_ts":1,"content":sealed["content"]}).to_string()).unwrap();
+    let plain = recipient.encryption().decrypt_received_room_event(room, &raw).await.unwrap();
+    let value: Value = serde_json::from_str(plain.raw().json().get()).unwrap();
+    assert_eq!(value["content"]["body"], "private original");
+}
+
+#[async_test]
+async fn test_encrypted_upload_checks_original_fence_before_any_media_http() {
+    let server = MatrixMockServer::new().await;
+    server.mock_crypto_endpoints_preset().await;
+    let client = host(&server).await;
+    let fence = Arc::new(matrix_sdk::HttpRequestFence::new(|| false));
+    let mut bytes = std::io::Cursor::new(b"private frozen file");
+    assert!(
+        client
+            .upload_encrypted_file(&mut bytes)
+            .with_request_config(matrix_sdk::config::RequestConfig::new().disable_retry())
+            .with_request_fence(fence.clone())
+            .await
+            .is_err()
+    );
+    fence.retire_and_drain().await.unwrap();
+    for r in server.server().received_requests().await.unwrap() {
+        assert!(!r.url.path().contains("/upload") || r.url.path().contains("/keys/"));
+    }
+}

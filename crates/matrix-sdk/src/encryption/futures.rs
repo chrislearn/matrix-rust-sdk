@@ -32,6 +32,7 @@ pub struct UploadEncryptedFile<'a, R: ?Sized> {
     reader: &'a mut R,
     send_progress: SharedObservable<TransmissionProgress>,
     request_config: Option<RequestConfig>,
+    request_fence: Option<std::sync::Arc<crate::HttpRequestFence>>,
 }
 
 impl<'a, R: ?Sized> UploadEncryptedFile<'a, R> {
@@ -41,7 +42,14 @@ impl<'a, R: ?Sized> UploadEncryptedFile<'a, R> {
             reader,
             send_progress: Default::default(),
             request_config: None,
+            request_fence: None,
         }
+    }
+
+    /// Fence this encrypted upload before each actual HTTP attempt.
+    pub fn with_request_fence(mut self, fence: std::sync::Arc<crate::HttpRequestFence>) -> Self {
+        self.request_fence = Some(fence);
+        self
     }
 
     /// Replace the default `SharedObservable` used for tracking upload
@@ -82,7 +90,7 @@ where
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { client, reader, send_progress, request_config } = self;
+        let Self { client, reader, send_progress, request_config, request_fence } = self;
         Box::pin(async move {
             let mut encryptor = matrix_sdk_base::crypto::AttachmentEncryptor::new(reader);
 
@@ -94,11 +102,15 @@ where
             let request_config =
                 request_config.map(|config| config.timeout(Media::reasonable_upload_timeout(&buf)));
 
-            let response = client
+            let request = client
                 .media()
                 .upload(&mime::APPLICATION_OCTET_STREAM, buf, request_config)
-                .with_send_progress_observable(send_progress)
-                .await?;
+                .with_send_progress_observable(send_progress);
+            let response = if let Some(fence) = request_fence {
+                request.with_request_fence(fence).await?
+            } else {
+                request.await?
+            };
 
             let file: EncryptedFile = {
                 let keys = encryptor.finish();

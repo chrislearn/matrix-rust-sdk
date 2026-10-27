@@ -1268,6 +1268,30 @@ impl OlmMachine {
         ))
     }
 
+    /// Create detached ciphertext and key shares for one verified recipient.
+    /// No room key is shared or network write performed by this method.
+    pub async fn seal_room_event_for_verified_user(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+        content: &Raw<AnyMessageLikeEventContent>,
+        recipient: &UserId,
+    ) -> OlmResult<(RawEncryptionResult, Vec<ToDeviceRequest>)> {
+        let (result, requests) = self
+            .inner
+            .group_session_manager
+            .seal_for_verified_user(room_id, event_type, content, recipient)
+            .await?;
+        Ok((
+            RawEncryptionResult {
+                content: result.content,
+                encryption_info: self
+                    .own_encryption_info(result.algorithm, result.session_id.to_string()),
+            },
+            requests,
+        ))
+    }
+
     fn own_encryption_info(
         &self,
         algorithm: EventEncryptionAlgorithm,

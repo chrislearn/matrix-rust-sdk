@@ -237,6 +237,23 @@ impl GroupSessionManager {
         event_type: &str,
         content: &Raw<AnyMessageLikeEventContent>,
     ) -> OlmResult<(OutboundGroupSessionEncryptionResult, Vec<ToDeviceRequest>)> {
+        self.seal_for_verified_user(
+            room_id,
+            event_type,
+            content,
+            self.store.static_account().user_id(),
+        )
+        .await
+    }
+
+    /// Seal one event for the verified devices of exactly one user.
+    pub async fn seal_for_verified_user(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+        content: &Raw<AnyMessageLikeEventContent>,
+        recipient: &UserId,
+    ) -> OlmResult<(OutboundGroupSessionEncryptionResult, Vec<ToDeviceRequest>)> {
         let account = self.store.static_account();
         let settings = EncryptionSettings {
             history_visibility: ruma::events::room::history_visibility::HistoryVisibility::Joined,
@@ -258,7 +275,7 @@ impl GroupSessionManager {
         }
         let recipients = share_strategy::collect_recipients_for_share_strategy(
             &self.store,
-            iter::once(account.user_id()),
+            iter::once(recipient),
             &CollectStrategy::IdentityBasedStrategy,
             None,
         )

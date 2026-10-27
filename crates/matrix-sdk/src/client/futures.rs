@@ -211,6 +211,11 @@ pub struct SendMediaUploadRequest {
 }
 
 impl SendMediaUploadRequest {
+    /// Fence this upload at the actual HTTP admission, including queue waits.
+    pub fn with_request_fence(mut self, fence: Arc<crate::HttpRequestFence>) -> Self {
+        self.send_request = self.send_request.with_request_fence(fence);
+        self
+    }
     pub fn new(request: SendRequest<media::create_content::v3::Request>) -> Self {
         Self { send_request: request }
     }
