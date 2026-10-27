@@ -1243,6 +1243,31 @@ impl OlmMachine {
         })
     }
 
+    /// Encrypt one room event with a fresh detached Megolm session shared only
+    /// with cross-signed remote devices of this account. The returned key-share
+    /// requests must be sent before the ciphertext. No outbound room session is
+    /// persisted or reused; losing this result cannot reconstruct a send.
+    pub async fn seal_room_event_for_own_devices(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+        content: &Raw<AnyMessageLikeEventContent>,
+    ) -> OlmResult<(RawEncryptionResult, Vec<ToDeviceRequest>)> {
+        let (result, requests) = self
+            .inner
+            .group_session_manager
+            .seal_for_own_devices(room_id, event_type, content)
+            .await?;
+        Ok((
+            RawEncryptionResult {
+                content: result.content,
+                encryption_info: self
+                    .own_encryption_info(result.algorithm, result.session_id.to_string()),
+            },
+            requests,
+        ))
+    }
+
     fn own_encryption_info(
         &self,
         algorithm: EventEncryptionAlgorithm,

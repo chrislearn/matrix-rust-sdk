@@ -228,6 +228,71 @@ impl GroupSessionManager {
         Ok(result)
     }
 
+    /// Seal one event with a fresh, detached Megolm session. Never insert its
+    /// outbound key into the room cache/store: ordinary room sends must not
+    /// reuse or broaden the recipients of this sensitive session.
+    pub async fn seal_for_own_devices(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+        content: &Raw<AnyMessageLikeEventContent>,
+    ) -> OlmResult<(OutboundGroupSessionEncryptionResult, Vec<ToDeviceRequest>)> {
+        let account = self.store.static_account();
+        let settings = EncryptionSettings {
+            history_visibility: ruma::events::room::history_visibility::HistoryVisibility::Joined,
+            sharing_strategy: CollectStrategy::IdentityBasedStrategy,
+            rotation_period_msgs: 1,
+            ..Default::default()
+        };
+        let (outbound, mut inbound) = account
+            .create_group_session_pair(room_id, settings, SenderData::unknown())
+            .await
+            .map_err(|_| EventError::UnsupportedAlgorithm)?;
+        if let Some(device) = self.store.get_device(account.user_id(), account.device_id()).await? {
+            inbound.sender_data = SenderDataFinder::find_using_device_data(
+                &self.store,
+                device.inner.clone(),
+                &inbound,
+            )
+            .await?;
+        }
+        let recipients = share_strategy::collect_recipients_for_share_strategy(
+            &self.store,
+            iter::once(account.user_id()),
+            &CollectStrategy::IdentityBasedStrategy,
+            None,
+        )
+        .await?;
+        let devices: Vec<_> = recipients.devices.into_values().flatten().collect();
+        if devices.is_empty() || devices.len() > 64 {
+            return Err(OlmError::OwnDeviceRecipientsUnavailable);
+        }
+        let mut changes = Changes::default();
+        let mut requests = Vec::new();
+        for chunk in devices.chunks(Self::MAX_TO_DEVICE_MESSAGES) {
+            let (result, _) = Self::encrypt_session_for(
+                self.store.crypto_store(),
+                outbound.clone(),
+                chunk.to_vec(),
+            )
+            .await?;
+            changes.sessions.extend(result.updated_olm_sessions);
+            // Ratchets advance even if one recipient has no session. Persist
+            // them before failing, but never expose a partial key-share batch.
+            if !result.no_olm_devices.is_empty() {
+                self.store.save_changes(changes).await?;
+                return Err(OlmError::MissingSession);
+            }
+            if let Some(request) = result.to_device_request {
+                requests.push(request);
+            }
+        }
+        let encrypted = outbound.encrypt(event_type, content).await;
+        changes.inbound_group_sessions.push(inbound);
+        self.store.save_changes(changes).await?;
+        Ok((encrypted, requests))
+    }
+
     /// Encrypts a state event for the given room using its outbound group
     /// session.
     ///

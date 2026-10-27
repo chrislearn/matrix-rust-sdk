@@ -197,6 +197,10 @@ pub mod identity_status_changes;
 pub mod knock_requests;
 mod member;
 mod messages;
+#[cfg(feature = "e2e-encryption")]
+mod own_device_message;
+#[cfg(feature = "e2e-encryption")]
+pub use own_device_message::OwnDeviceMessage;
 pub mod power_levels;
 pub mod reply;
 
