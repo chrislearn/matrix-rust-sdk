@@ -324,6 +324,11 @@ pub enum Error {
     #[error(transparent)]
     EventCacheStore(Box<EventCacheStoreError>),
 
+    /// The optional native upload admission or original IO boundary failed.
+    #[cfg(not(target_family = "wasm"))]
+    #[error(transparent)]
+    UploadGovernor(#[from] crate::upload_governor::UploadGovernorError),
+
     /// An error occurred in the media store.
     #[error(transparent)]
     MediaStore(Box<MediaStoreError>),

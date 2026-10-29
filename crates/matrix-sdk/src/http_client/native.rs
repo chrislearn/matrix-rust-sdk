@@ -147,6 +147,11 @@ impl HttpClient {
                 // After semaphore waits and on EVERY retry, before transport IO.
                 let _permit = self.request_fence.as_ref().map(|f| f.begin_request()).transpose()?;
                 let _scope = self.request_scope.as_ref().map(|f| f.begin_request()).transpose()?;
+                // Receipt records actual transport admission, never inferred
+                // from an error name.
+                if let Some(owner) = &self.body_owner {
+                    owner.admissions.fetch_add(1, Ordering::AcqRel);
+                }
                 let response = send_request_inner(
                     &self.inner,
                     &request,

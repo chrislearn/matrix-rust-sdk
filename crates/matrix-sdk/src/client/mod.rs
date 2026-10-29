@@ -2121,6 +2121,7 @@ impl Client {
             request,
             config: None,
             request_fence: None,
+            body_owner: None,
             send_progress: Default::default(),
         }
     }
@@ -2139,6 +2140,24 @@ impl Client {
         for<'a> <Request::PathBuilder as PathBuilder>::Input<'a>: SendOutsideWasm + SyncOutsideWasm,
         HttpError: From<FromHttpResponseError<Request::EndpointError>>,
     {
+        self.send_inner_with_body_owner(request, config, send_progress, request_fence, None).await
+    }
+
+    pub(crate) async fn send_inner_with_body_owner<Request>(
+        &self,
+        request: Request,
+        config: Option<RequestConfig>,
+        send_progress: SharedObservable<TransmissionProgress>,
+        request_fence: Option<Arc<crate::HttpRequestFence>>,
+        body_owner: Option<crate::http_client::BodyOwner>,
+    ) -> HttpResult<Request::IncomingResponse>
+    where
+        Request: OutgoingRequest + Debug,
+        Request::Authentication: SupportedAuthScheme,
+        Request::PathBuilder: SupportedPathBuilder,
+        for<'a> <Request::PathBuilder as PathBuilder>::Input<'a>: SendOutsideWasm + SyncOutsideWasm,
+        HttpError: From<FromHttpResponseError<Request::EndpointError>>,
+    {
         let homeserver = self.homeserver().to_string();
         let access_token = self.access_token();
         let skip_auth = config.map(|c| c.skip_auth).unwrap_or(self.request_config().skip_auth);
@@ -2148,6 +2167,7 @@ impl Client {
 
         let mut http = self.inner.http_client.clone();
         http.request_scope = request_fence;
+        http.body_owner = body_owner;
         let result = http
             .send(
                 request,
@@ -5611,6 +5631,7 @@ pub(crate) mod tests {
             request: upload_request,
             config: None,
             request_fence: None,
+            body_owner: None,
             send_progress: SharedObservable::new(TransmissionProgress::default()),
         };
         let media_request = SendMediaUploadRequest::new(request);

@@ -45,6 +45,7 @@ pub struct SendRequest<R> {
     pub(crate) request: R,
     pub(crate) config: Option<RequestConfig>,
     pub(crate) request_fence: Option<Arc<crate::HttpRequestFence>>,
+    pub(crate) body_owner: Option<crate::http_client::BodyOwner>,
     pub(crate) send_progress: SharedObservable<TransmissionProgress>,
 }
 
@@ -173,14 +174,15 @@ where
             }
         }
 
-        let Self { client, request, config, send_progress, request_fence } = self;
+        let Self { client, request, config, send_progress, request_fence, body_owner } = self;
 
         Box::pin(async move {
-            let res = Box::pin(client.send_inner(
+            let res = Box::pin(client.send_inner_with_body_owner(
                 request.clone(),
                 config,
                 send_progress.clone(),
                 request_fence.clone(),
+                body_owner.clone(),
             ))
             .await;
 
@@ -188,11 +190,12 @@ where
                 && let Err(e) = &res
                 && let RetryRequest::Yes = handle_unknown_token_error(e, &client).await?
             {
-                return Box::pin(client.send_inner(
+                return Box::pin(client.send_inner_with_body_owner(
                     request,
                     config,
                     send_progress,
                     request_fence.clone(),
+                    body_owner.clone(),
                 ))
                 .await;
             }
@@ -211,6 +214,11 @@ pub struct SendMediaUploadRequest {
 }
 
 impl SendMediaUploadRequest {
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn with_upload_custody(mut self, owner: crate::http_client::BodyOwner) -> Self {
+        self.send_request.body_owner = Some(owner);
+        self
+    }
     /// Fence this upload at the actual HTTP admission, including queue waits.
     pub fn with_request_fence(mut self, fence: Arc<crate::HttpRequestFence>) -> Self {
         self.send_request = self.send_request.with_request_fence(fence);

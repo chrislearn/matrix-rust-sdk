@@ -74,10 +74,31 @@ impl MaybeSemaphore {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct BodyOwner {
+    pub(crate) _custody: Arc<dyn Send + Sync>,
+    pub(crate) admissions: Arc<AtomicU64>,
+}
+impl Debug for BodyOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpaqueHttpBodyOwner")
+    }
+}
+struct OwnedBody {
+    bytes: Bytes,
+    _owner: BodyOwner,
+}
+impl AsRef<[u8]> for OwnedBody {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct HttpClient {
     pub(crate) request_fence: Option<Arc<crate::HttpRequestFence>>,
     pub(crate) request_scope: Option<Arc<crate::HttpRequestFence>>,
+    pub(crate) body_owner: Option<BodyOwner>,
     pub(crate) inner: reqwest::Client,
     pub(crate) request_config: RequestConfig,
     concurrent_request_semaphore: MaybeSemaphore,
@@ -89,6 +110,7 @@ impl HttpClient {
         HttpClient {
             request_fence: None,
             request_scope: None,
+            body_owner: None,
             inner,
             request_config,
             concurrent_request_semaphore: MaybeSemaphore::new(
@@ -103,7 +125,7 @@ impl HttpClient {
         format!("REQ-{request_id}")
     }
 
-    fn serialize_request<R>(
+    pub(crate) fn serialize_request<R>(
         &self,
         request: R,
         config: RequestConfig,
@@ -133,7 +155,13 @@ impl HttpClient {
                 authentication_input,
                 path_builder_input,
             )?
-            .map(|body| body.freeze());
+            .map(|body| {
+                let bytes = body.freeze();
+                match self.body_owner.clone() {
+                    Some(owner) => Bytes::from_owner(OwnedBody { bytes, _owner: owner }),
+                    None => bytes,
+                }
+            });
 
         Ok(request)
     }

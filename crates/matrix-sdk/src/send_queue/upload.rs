@@ -423,6 +423,41 @@ impl RoomSendQueue {
         file_media_request: &MediaRequestParameters,
     ) -> Result<MediaCacheResult, RoomSendQueueError> {
         let client = room.client();
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(governor) = client.send_queue().upload_governor() {
+            let limit = governor.limits().max_file_bytes;
+            if data.len() > limit
+                || thumbnail.as_ref().is_some_and(|value| value.data.len() > limit)
+            {
+                return Err(crate::upload_governor::UploadGovernorError::TooLarge {
+                    max_bytes: limit,
+                }
+                .into());
+            }
+            let payload = data
+                .len()
+                .checked_add(thumbnail.as_ref().map_or(0, |value| value.data.len()))
+                .ok_or(crate::upload_governor::UploadGovernorError::Capacity)?;
+            let weak = client.downgrade();
+            let request = file_media_request.clone();
+            return governor
+                .submit(payload, move |custody, _| async move {
+                    let client =
+                        weak.get().ok_or(crate::upload_governor::UploadGovernorError::Paused)?;
+                    custody.retain_client(&client);
+                    Self::cache_media_inner(&client, data, thumbnail, &request).await
+                })?
+                .await;
+        }
+        Self::cache_media_inner(&client, data, thumbnail, file_media_request).await
+    }
+
+    async fn cache_media_inner(
+        client: &Client,
+        data: Vec<u8>,
+        thumbnail: Option<Thumbnail>,
+        file_media_request: &MediaRequestParameters,
+    ) -> Result<MediaCacheResult, RoomSendQueueError> {
         let media_store =
             client.media_store().lock().await.map_err(RoomSendQueueStorageError::LockError)?;
 
@@ -980,6 +1015,29 @@ async fn update_media_cache_keys_after_upload(
     thumbnail_info: Option<FinishUploadThumbnailInfo>,
     sent_media: &SentMediaInfo,
 ) -> Result<(), RoomSendQueueError> {
+    #[cfg(not(target_family = "wasm"))]
+    if let Some(governor) = client.send_queue().upload_governor() {
+        let weak = client.downgrade();
+        let txn = file_upload_txn.clone();
+        let sent = sent_media.clone();
+        return governor
+            .submit(0, move |custody, _| async move {
+                let client =
+                    weak.get().ok_or(crate::upload_governor::UploadGovernorError::Paused)?;
+                custody.retain_client(&client);
+                update_media_cache_keys_inner(&client, &txn, thumbnail_info, &sent).await
+            })?
+            .await;
+    }
+    update_media_cache_keys_inner(client, file_upload_txn, thumbnail_info, sent_media).await
+}
+
+async fn update_media_cache_keys_inner(
+    client: &Client,
+    file_upload_txn: &OwnedTransactionId,
+    thumbnail_info: Option<FinishUploadThumbnailInfo>,
+    sent_media: &SentMediaInfo,
+) -> Result<(), RoomSendQueueError> {
     // Do it for the file itself.
     let from_req = Media::make_local_file_media_request(file_upload_txn);
 
@@ -1016,16 +1074,35 @@ async fn update_media_cache_keys_after_upload(
                 "storing thumbnail as a thumbnail for the uploaded media, and a file in itself, in cache store"
             );
 
-            // Try to reload the content of the thumbnail from the media store. As it's not
-            // a strong requirement to store the thumbnail a second time, we
-            // silently log errors instead of propagating them to the caller.
-            match media_store
-                .get_media_content(&MediaRequestParameters {
-                    source: from_request_params.source.clone(),
-                    format: MediaFormat::File,
-                })
-                .await
-            {
+            // Try to reload the content of the thumbnail from the media store.
+            // As it's not a strong requirement to store the
+            // thumbnail a second time, we silently log errors
+            // instead of propagating them to the caller.
+            let request = MediaRequestParameters {
+                source: from_request_params.source.clone(),
+                format: MediaFormat::File,
+            };
+            // Already inside the original governor operation: never re-enter
+            // its single worker while holding a
+            // media-store/QueueStorage lock.
+            #[cfg(not(target_family = "wasm"))]
+            let thumbnail_content = if let Some(governor) = client.send_queue().upload_governor() {
+                match media_store
+                    .get_media_content_bounded(&request, governor.limits().max_file_bytes)
+                    .await
+                {
+                    Ok(content) => Ok(content),
+                    Err(error) => {
+                        warn!("bounded optional thumbnail recache rejected: {error}");
+                        Ok(None)
+                    }
+                }
+            } else {
+                media_store.get_media_content(&request).await
+            };
+            #[cfg(target_family = "wasm")]
+            let thumbnail_content = media_store.get_media_content(&request).await;
+            match thumbnail_content {
                 Ok(Some(thumbnail_content)) => {
                     // Also cache this as a thumbnail for the thumbnail, in the media store; the
                     // ElementX apps expect that specific format for thumbnails.

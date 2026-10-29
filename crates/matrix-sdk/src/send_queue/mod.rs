@@ -274,6 +274,12 @@ impl SendQueue {
         room_q
     }
 
+    /// Observe the original optional host-shared media governor without IO.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn upload_governor(&self) -> Option<Arc<crate::upload_governor::UploadGovernor>> {
+        self.data().upload_governor.clone()
+    }
+
     /// Enable or disable the send queue for the entire client, i.e. all rooms.
     ///
     /// If we're disabling the queue, and requests were being sent, they're not
@@ -414,6 +420,8 @@ pub(super) struct SendQueueData {
 
     /// Will media upload progress be reported via send queue updates?
     report_media_upload_progress: Arc<AtomicBool>,
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) upload_governor: Option<Arc<crate::upload_governor::UploadGovernor>>,
 }
 
 impl SendQueueData {
@@ -429,6 +437,8 @@ impl SendQueueData {
             error_sender,
             is_dropping: Arc::new(false.into()),
             report_media_upload_progress: Arc::new(false.into()),
+            #[cfg(not(target_family = "wasm"))]
+            upload_governor: None,
         }
     }
 }
@@ -685,7 +695,13 @@ impl RoomSendQueue {
             // Try to apply dependent requests now; those applying to previously failed
             // attempts (local echoes) would succeed now.
             let mut new_updates = Vec::new();
-            if let Err(err) = queue.apply_dependent_requests(&mut new_updates).await {
+            #[cfg(not(target_family = "wasm"))]
+            let mut completion_capacity = room
+                .get()
+                .and_then(|room| room.client().send_queue().upload_governor())
+                .map(|governor| governor.capacity());
+            let dependent_result = queue.apply_dependent_requests(&mut new_updates).await;
+            if let Err(ref err) = dependent_result {
                 warn!("errors when applying dependent requests: {err}");
             }
 
@@ -693,6 +709,34 @@ impl RoomSendQueue {
                 send_update(&global_update_sender, &update_sender, room_id, up);
             }
 
+            #[cfg(not(target_family = "wasm"))]
+            if matches!(
+                dependent_result,
+                Err(RoomSendQueueError::UploadGovernor(
+                    crate::upload_governor::UploadGovernorError::Capacity
+                ))
+            ) {
+                // Completion keeps the original durable parent receipt. Wake
+                // when its physical cache slot is available
+                // even if no new UI action arrives.
+                if let Some(changed) = completion_capacity.as_mut() {
+                    tokio::select! { _ = changed.changed() => {}, _ = notifier.notified() => {} }
+                    continue;
+                }
+            }
+            #[cfg(not(target_family = "wasm"))]
+            if let Err(RoomSendQueueError::UploadGovernor(policy)) = &dependent_result {
+                // No newly admitted original work is waiting here. Its outbox
+                // guard already returned; preserve the durable dependent
+                // receipt and require explicit resume for
+                // stop/unknown policy failures.
+                locally_enabled.store(false, Ordering::SeqCst);
+                let _ = global_error_sender.send(SendQueueRoomError {
+                    room_id: room_id.to_owned(),
+                    error: Arc::new(crate::Error::UploadGovernor(policy.clone())),
+                    is_recoverable: true,
+                });
+            }
             if !locally_enabled.load(Ordering::SeqCst) {
                 trace!("not enabled, sleeping");
                 // Wait for an explicit wakeup.
@@ -721,13 +765,13 @@ impl RoomSendQueue {
             let txn_id = queued_request.transaction_id.clone();
             trace!(txn_id = %txn_id, "received a request to send!");
 
-            let Some(room) = room.get() else {
+            if room.get().is_none() {
                 if is_dropping.load(Ordering::SeqCst) {
                     break;
                 }
                 error!("the weak room couldn't be upgraded but we're not shutting down?");
                 continue;
-            };
+            }
 
             // If this is a media/gallery upload, prepare the following:
             // - transaction id for the related media event request,
@@ -776,8 +820,16 @@ impl RoomSendQueue {
                     Default::default()
                 };
 
-            match Self::handle_request(&room, queued_request, cancel_upload_rx, http_progress).await
-            {
+            #[cfg(not(target_family = "wasm"))]
+            let mut capacity_changed = room
+                .get()
+                .and_then(|room| room.client().send_queue().upload_governor())
+                .map(|governor| governor.capacity());
+            let result =
+                Self::handle_request(&room, queued_request, cancel_upload_rx, http_progress).await;
+            // No StrongClient is retained while metadata waits for admission.
+            let Some(room) = room.get() else { break };
+            match result {
                 Ok((Some(parent_key), encryption_info)) => match queue
                     .mark_as_sent(&txn_id, parent_key.clone())
                     .await
@@ -1010,13 +1062,28 @@ impl RoomSendQueue {
                         // recoverable, and let observers decide to retry it or not. At some point
                         // we'll get the actual underlying error.
                         crate::Error::ConcurrentRequestFailed => true,
+                        #[cfg(not(target_family = "wasm"))]
+                        crate::Error::UploadGovernor(_) => true,
 
                         // As of 2024-06-27, all other error types are considered unrecoverable.
                         _ => false,
                     };
 
-                    // Disable the queue for this room after any kind of error happened.
-                    locally_enabled.store(false, Ordering::SeqCst);
+                    #[cfg(not(target_family = "wasm"))]
+                    let capacity_deferred = matches!(
+                        err,
+                        crate::Error::UploadGovernor(
+                            crate::upload_governor::UploadGovernorError::Capacity
+                        )
+                    );
+                    #[cfg(target_family = "wasm")]
+                    let capacity_deferred = false;
+                    // Capacity retries use the original durable transaction.
+                    // All other policy failures require
+                    // explicit queue resume, including unknown IO.
+                    if !capacity_deferred {
+                        locally_enabled.store(false, Ordering::SeqCst);
+                    }
 
                     if is_recoverable {
                         warn!(txn_id = %txn_id, error = ?err, "Recoverable error when sending request: {err}, disabling send queue");
@@ -1061,6 +1128,15 @@ impl RoomSendQueue {
                             is_recoverable,
                         },
                     );
+                    #[cfg(not(target_family = "wasm"))]
+                    if capacity_deferred {
+                        drop(room);
+                        if let Some(changed) = capacity_changed.as_mut() {
+                            tokio::select! { _ = changed.changed() => {}, _ = notifier.notified() => {} }
+                        } else {
+                            notifier.notified().await;
+                        }
+                    }
                 }
             }
         }
@@ -1072,11 +1148,14 @@ impl RoomSendQueue {
     /// (unless the request was cancelled, in which case it'll return
     /// `None`).
     async fn handle_request(
-        room: &Room,
+        weak_room: &WeakRoom,
         request: QueuedRequest,
         cancel_upload_rx: Option<oneshot::Receiver<()>>,
         progress: Option<SharedObservable<TransmissionProgress>>,
     ) -> Result<(Option<SentRequestKey>, Option<EncryptionInfo>), crate::Error> {
+        let room = weak_room.get().ok_or(crate::Error::UnknownError(Box::new(
+            std::io::Error::other("original room no longer exists"),
+        )))?;
         match request.kind {
             QueuedRequestKind::Event { content } => {
                 let (event, event_type) = content.into_raw();
@@ -1109,6 +1188,44 @@ impl RoomSendQueue {
             } => {
                 trace!(%relates_to, "uploading media related to event");
 
+                #[cfg(not(target_family = "wasm"))]
+                if let Some(governor) = room.client().send_queue().upload_governor() {
+                    let weak = weak_room.clone();
+                    drop(room);
+                    let limit = governor.limits().max_file_bytes;
+                    let operation = governor.submit(0, move |custody, live| async move {
+                        let room = weak
+                            .get()
+                            .ok_or(crate::upload_governor::UploadGovernorError::Paused)?;
+                        if !room.send_queue().is_enabled() {
+                            return Err(crate::upload_governor::UploadGovernorError::Paused.into());
+                        }
+                        let media_source = crate::upload_governor::upload_original(
+                            &room,
+                            cache_key,
+                            content_type,
+                            progress,
+                            limit,
+                            custody,
+                            live,
+                        )
+                        .await?;
+                        Ok((
+                            Some(SentRequestKey::Media(SentMediaInfo {
+                                file: media_source,
+                                thumbnail: thumbnail_source,
+                                #[cfg(feature = "unstable-msc4274")]
+                                accumulated,
+                            })),
+                            None,
+                        ))
+                    })?;
+                    return tokio::select! {
+                        biased;
+                        _ = async { if let Some(rx) = cancel_upload_rx { let _ = rx.await; } else { std::future::pending::<()>().await } } => Ok((None, None)),
+                        result = operation => result,
+                    };
+                }
                 let fut = async move {
                     let data = room
                         .client()
@@ -2491,6 +2608,15 @@ impl QueueStorage {
                 }
 
                 Err(err) => {
+                    #[cfg(not(target_family = "wasm"))]
+                    if let RoomSendQueueError::UploadGovernor(ref policy) = err {
+                        new_updates.push(RoomSendQueueUpdate::SendError {
+                            transaction_id: dependent_id.into(),
+                            error: Arc::new(crate::Error::UploadGovernor(policy.clone())),
+                            is_recoverable: true,
+                        });
+                        return Err(err);
+                    }
                     warn!("error when applying single dependent request: {err}");
                 }
             }
@@ -2673,6 +2799,10 @@ pub struct SendQueueUpdate {
 /// An error triggered by the send queue module.
 #[derive(Debug, thiserror::Error)]
 pub enum RoomSendQueueError {
+    /// Optional native upload ownership/admission failure.
+    #[cfg(not(target_family = "wasm"))]
+    #[error(transparent)]
+    UploadGovernor(#[from] crate::upload_governor::UploadGovernorError),
     /// The room isn't in the joined state.
     #[error("the room isn't in the joined state")]
     RoomNotJoined,

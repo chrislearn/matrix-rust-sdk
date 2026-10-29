@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 <!-- changelog start -->
 
+## Unreleased Hagency fork
+
+### Added
+
+- Optional native `UploadGovernor`, shared by a host across SDK clients, bounds
+  buffered background/restored attachment IO and retains original SQL, crypto,
+  HTTP body and client custody through cancellation. The default remains disabled.
+  See `HAGENCY-BOUNDED-UPLOADS.md` for limits, outbox behavior and memory scope.
+
 ## [0.19.1](https://github.com/matrix-org/matrix-rust-sdk/tree/0.19.1) - 2026-09-18
 
 ### Fixed
