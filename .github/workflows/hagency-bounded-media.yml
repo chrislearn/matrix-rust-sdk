@@ -45,6 +45,8 @@ jobs:
         run: cargo test --locked -p matrix-sdk-base --lib bounded_media_
       - name: Actual SQLite media store and original compatibility suite
         run: cargo test --locked -p matrix-sdk-sqlite --features bundled --lib 'media_store::'
+      - name: Read-only original crypto identity and live WAL snapshots
+        run: cargo test --locked -p matrix-sdk-sqlite --features bundled,crypto-store --lib inspect_existing_account_identity
       - name: Original encryption suite and malformed envelopes
         run: cargo test --locked -p matrix-sdk-store-encryption --lib
       - name: Public weak Client identity and lifetime with default history

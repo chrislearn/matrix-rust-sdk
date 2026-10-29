@@ -41,6 +41,8 @@ const XNONCE_SIZE: usize = 24;
 const KDF_ROUNDS: u32 = 200_000;
 
 #[cfg(test)]
+mod bounded_import_tests;
+#[cfg(test)]
 mod bounded_media_tests;
 
 const BASE64: GeneralPurpose = GeneralPurpose::new(&alphabet::STANDARD, general_purpose::NO_PAD);
@@ -73,6 +75,15 @@ pub enum Error {
     /// The ciphertext had an invalid length.
     #[error("The ciphertext had an invalid length, expected `{0}`, got `{1}`")]
     Length(usize, usize),
+
+    /// The stored PBKDF2 cost exceeds the caller's explicit import policy.
+    #[error("PBKDF2 import cost {found} exceeds limit {max}")]
+    KdfRoundLimit {
+        /// Stored PBKDF2 iteration count.
+        found: u32,
+        /// Maximum accepted iteration count.
+        max: u32,
+    },
 
     /// Failed to import the store cipher. The export was created using a
     /// different encryption mechanism than the one being used for import
@@ -292,6 +303,31 @@ impl StoreCipher {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn import(passphrase: &str, encrypted: &[u8]) -> Result<Self, Error> {
+        Self::import_passphrase(passphrase, encrypted, None)
+    }
+
+    /// Restore an existing cipher while bounding its declared PBKDF2 cost.
+    ///
+    /// This accepts the same MessagePack and legacy JSON formats as
+    /// [`Self::import`]. Before deriving a passphrase key, it rejects a stored
+    /// iteration count above `max_rounds` with [`Error::KdfRoundLimit`]. It does
+    /// not rewrite the export, lower its cost, or change the original key.
+    /// Normal exports currently use 200,000 iterations. Raw-key/HKDF exports
+    /// still return [`Error::KdfMismatch`]. The iteration limit does not bound
+    /// input parsing allocations; callers must separately limit input size.
+    pub fn import_with_round_limit(
+        passphrase: &str,
+        encrypted: &[u8],
+        max_rounds: u32,
+    ) -> Result<Self, Error> {
+        Self::import_passphrase(passphrase, encrypted, Some(max_rounds))
+    }
+
+    fn import_passphrase(
+        passphrase: &str,
+        encrypted: &[u8],
+        max_rounds: Option<u32>,
+    ) -> Result<Self, Error> {
         // Our old export format used serde_json for the serialization format. Let's
         // first try the new format and if that fails, try the old one.
         let encrypted: EncryptedStoreCipher =
@@ -303,6 +339,11 @@ impl StoreCipher {
 
         let key = match encrypted.kdf_info {
             KdfInfo::Pbkdf2ToChaCha20Poly1305 { rounds, kdf_salt } => {
+                if let Some(max) = max_rounds
+                    && rounds > max
+                {
+                    return Err(Error::KdfRoundLimit { found: rounds, max });
+                }
                 Self::expand_key(passphrase, &kdf_salt, rounds)
             }
             KdfInfo::None | KdfInfo::HkdfSha256 => {
