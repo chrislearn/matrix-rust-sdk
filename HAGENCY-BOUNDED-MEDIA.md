@@ -53,3 +53,12 @@ The strict lint uses SQLite's crypto-store feature as well as its default
 state/event/media features; three pre-existing shared utility methods have
 callers only in crypto-store, so a partial-feature `-D warnings` lint otherwise
 reports their dead code. No lint exception or source suppression is added.
+
+The first hosted run at `758d0a95fc5dcf33b2da33e673a6a7b50f17b819`
+passed the new Linux and Windows checks, workflow lint and full documentation.
+Its original linked-chunk benchmark built successfully, but the pinned
+CodSpeed runner 5.2.1 failed at launch with `Unsupported system` on the newly
+migrated `ubuntu-latest` image (26.04.1). The benchmark workflow now explicitly
+uses Ubuntu 24.04 and retains all six original benchmarks without error
+exemptions. The reviewed toolchain action commit is unchanged; its moving-tag
+comment is replaced with an accurate immutable-revision description.
