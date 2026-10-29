@@ -314,6 +314,7 @@ impl Caches {
                     // otherwise its StateLock entry has no cache-map owner.
                     #[cfg(feature = "hagency-bounded-history")]
                     event_focused_caches.insert(key.clone(), cache.clone());
+                    #[cfg(feature = "hagency-bounded-history")]
                     if let Err(error)=cache.start_from(number_of_initial_events, thread_mode).await {
                         #[cfg(feature = "hagency-bounded-history")]
                         {
@@ -324,6 +325,9 @@ impl Caches {
                         }
                         return Err(error);
                     }
+
+                    #[cfg(not(feature = "hagency-bounded-history"))]
+                    cache.start_from(number_of_initial_events, thread_mode).await?;
 
                     #[cfg(not(feature = "hagency-bounded-history"))]
                     event_focused_caches.insert(key.clone(), cache);

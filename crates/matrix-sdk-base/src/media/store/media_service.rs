@@ -223,6 +223,14 @@ where
         Ok(content)
     }
 
+    /// Schedule the usual retention cleanup after a backend's bounded read.
+    ///
+    /// This does not read or copy the entry itself. Backends must finish their
+    /// allocation-bounded operation and release their entry/transaction first.
+    pub fn bounded_read_finished<Store: MediaStoreInner + 'static>(&self, store: &Store) {
+        self.maybe_spawn_automatic_media_cache_cleanup(store, self.now());
+    }
+
     /// Clean up the media cache with the current `MediaRetentionPolicy`.
     ///
     /// If there is already an ongoing cleanup, this is a noop.
