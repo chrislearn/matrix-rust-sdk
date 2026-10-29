@@ -17,7 +17,7 @@ transaction through the copy, excluding replacement by another connection or
 process. Plain reads copy at most `max_bytes`. Encrypted at-rest entries use the
 existing canonical MessagePack `EncryptedValue`, not JSON/base64: ciphertext is
 binary and the nonce is fixed at 24 bytes. The encoded blob is limited to
-`max_bytes + 128` with checked arithmetic before reading. A borrowed binary-only
+`max_bytes + 128` with checked arithmetic before reading. A borrowed-bytes
 visitor rejects sequence/owned-buffer allocation hints, checks the implied plaintext
 length, and only then copies/authenticates with in-place AEAD. No failed tag
 produces usable plaintext. rmp-serde exposes invalid UTF-8 strings as borrowed
@@ -43,7 +43,12 @@ Targeted verification (use an independent target directory):
 cargo test --locked -p matrix-sdk-base --lib bounded_media_
 cargo test --locked -p matrix-sdk-sqlite --features bundled --lib media_store::
 cargo test --locked -p matrix-sdk-store-encryption --lib
+cargo test --locked -p matrix-sdk --features testing,bundled-sqlite --lib public_weak_client
+cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib public_weak_client
+cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib event_cache::retention::tests
 cargo clippy --locked --no-deps -p matrix-sdk-base -p matrix-sdk-sqlite -p matrix-sdk-store-encryption --features matrix-sdk-sqlite/bundled,matrix-sdk-sqlite/crypto-store --lib --tests -- -D warnings
+cargo clippy --locked --no-deps -p matrix-sdk --features testing,bundled-sqlite --lib --tests -- -D warnings
+cargo clippy --locked --no-deps -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib --tests -- -D warnings
 ```
 
 The dedicated pull-request workflow targets the actual
@@ -92,3 +97,26 @@ official `create_profile_folder` writes `profile.*.out` under `TMPDIR`, which is
 set to a dedicated runner temporary folder. The upstream `matrix-org` workflow
 retains cloud upload. Successful fork CI proves offline execution/measurement
 and retained results, not CodSpeed cloud publication or comparison baselines.
+
+Idle native file-dialog callbacks must not retain retired SDK stores or
+background resources. The same change exposes the existing opaque `WeakClient`
+at the crate root and `Client::downgrade`, forwarding the original
+`Weak<ClientInner>` implementation. `from_inner` and `strong_count` stay crate
+private; `from_client` and `get` keep their original behavior. A real unlogged
+Client test verifies that weak clones add no strong owner, upgrades retain the
+actual original inner identity, an existing Client clone remains usable, and
+all weak handles immediately return `None` after the last strong owner drops.
+This lets idle callbacks retain only weak state. Active network/IO jobs must
+still retain strong custody until their actual completion, and every upgraded
+handle still needs the caller's independent account/session authorization fence.
+The public Weak Client regression and Client library/test strict lint cover both
+default and App `hagency-bounded-history` profiles. Initial default-profile
+Clippy exposed a pre-existing cfg-only question-mark lint: when bounded cleanup
+was compiled out, its error branch only returned the error. An equivalent cfg
+split keeps the original bounded cleanup block unchanged and calls `start_from`
+exactly once in either profile. No cleanup/cancellation behavior or lint
+suppression was changed; the original failed Clippy log remains retained.
+
+The bounded-profile test lint also exposed redundant `&store` borrows after
+`as_clean()` already returned a store reference. Only those test-call borrows
+were removed; every fixture, production path and behavioral assertion remains.

@@ -47,5 +47,15 @@ jobs:
         run: cargo test --locked -p matrix-sdk-sqlite --features bundled --lib 'media_store::'
       - name: Original encryption suite and malformed envelopes
         run: cargo test --locked -p matrix-sdk-store-encryption --lib
+      - name: Public weak Client identity and lifetime with default history
+        run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite --lib public_weak_client
+      - name: Public weak Client identity and lifetime with bounded history
+        run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib public_weak_client
+      - name: Bounded history retention regressions
+        run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib event_cache::retention::tests
       - name: Strict affected library and test lint
         run: cargo clippy --locked --no-deps -p matrix-sdk-base -p matrix-sdk-sqlite -p matrix-sdk-store-encryption --features matrix-sdk-sqlite/bundled,matrix-sdk-sqlite/crypto-store --lib --tests -- -D warnings
+      - name: Strict default weak Client API and test lint
+        run: cargo clippy --locked --no-deps -p matrix-sdk --features testing,bundled-sqlite --lib --tests -- -D warnings
+      - name: Strict bounded weak Client API and test lint
+        run: cargo clippy --locked --no-deps -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib --tests -- -D warnings

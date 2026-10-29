@@ -51,13 +51,13 @@ async fn test_small_window_preserves_ids_order_and_disk_lookup() {
     let guard = client.event_cache_store().lock().await.unwrap();
     let store = guard.as_clean().unwrap();
     let id = LinkedChunkId::Room(room_id!("!budget:example.org"));
-    seed(&store, id, 4, 2, "within budget").await;
-    let (last, _, metadata) = load_snapshot(&store, id).await.unwrap();
+    seed(store, id, 4, 2, "within budget").await;
+    let (last, _, metadata) = load_snapshot(store, id).await.unwrap();
     assert_eq!(last.unwrap().identifier, ChunkIdentifier::new(3));
     let metadata = metadata.unwrap();
     assert_eq!(metadata.iter().map(|m| m.num_items).sum::<usize>(), 8);
     assert_eq!(metadata.len(), 4);
-    let chunk = load(&store, id).await.unwrap();
+    let chunk = load(store, id).await.unwrap();
     assert_eq!(chunk.events().count(), 2, "payload loading remains lazy");
     assert_eq!(chunk.event_order(Position::new(ChunkIdentifier::new(0), 1)), Some(1));
     assert!(store.find_event(id.room_id(), event_id!("$budget-room-0-0")).await.unwrap().is_some());
@@ -71,11 +71,11 @@ async fn test_room_load_and_trim_do_not_clear_sibling_thread_or_room() {
     let room = room_id!("!budget:example.org");
     let thread = LinkedChunkId::Thread(room, event_id!("$thread"));
     let other = LinkedChunkId::Room(room_id!("!other:example.org"));
-    seed(&store, thread, 2, 1, "thread survives").await;
-    seed(&store, other, 2, 1, "other room survives").await;
+    seed(store, thread, 2, 1, "thread survives").await;
+    seed(store, other, 2, 1, "other room survives").await;
     for chunks in [2, MAX_EVENTS + 1] {
-        seed(&store, LinkedChunkId::Room(room), chunks, 1, "room").await;
-        load(&store, LinkedChunkId::Room(room)).await.unwrap();
+        seed(store, LinkedChunkId::Room(room), chunks, 1, "room").await;
+        load(store, LinkedChunkId::Room(room)).await.unwrap();
         assert_eq!(store.load_all_chunks(thread).await.unwrap().len(), 2);
         assert_eq!(store.load_all_chunks(other).await.unwrap().len(), 2);
     }
@@ -90,11 +90,11 @@ async fn test_exact_event_limit_is_kept_and_one_more_is_bounded() {
         LinkedChunkId::Room(room_id!("!budget:example.org")),
         LinkedChunkId::Thread(room_id!("!budget:example.org"), event_id!("$thread")),
     ] {
-        seed(&store, id, 4, 128, "limit").await;
-        let (_, _, metadata) = load_snapshot(&store, id).await.unwrap();
+        seed(store, id, 4, 128, "limit").await;
+        let (_, _, metadata) = load_snapshot(store, id).await.unwrap();
         assert_eq!(metadata.unwrap().iter().map(|m| m.num_items).sum::<usize>(), MAX_EVENTS);
-        seed(&store, id, MAX_EVENTS + 1, 1, "overflow").await;
-        let mut chunk = load(&store, id).await.unwrap();
+        seed(store, id, MAX_EVENTS + 1, 1, "overflow").await;
+        let mut chunk = load(store, id).await.unwrap();
         assert!(chunk.events().count() <= KEEP_EVENTS);
         let (items, heads) = chunk.order_tracker.retained_metadata_size();
         assert!(items <= KEEP_EVENTS && heads <= 3);
@@ -105,7 +105,7 @@ async fn test_exact_event_limit_is_kept_and_one_more_is_bounded() {
                 |c| matches!(&c.content, ChunkContent::Gap(gap) if gap.token == WINDOW_BOUNDARY)
             )
         );
-        let reopened = load(&store, id).await.unwrap();
+        let reopened = load(store, id).await.unwrap();
         assert_eq!(reopened.events().count(), chunk.events().count());
     }
 }
@@ -116,10 +116,10 @@ async fn test_empty_chunk_metadata_is_bounded_too() {
     let guard = client.event_cache_store().lock().await.unwrap();
     let store = guard.as_clean().unwrap();
     let id = LinkedChunkId::Room(room_id!("!budget:example.org"));
-    seed(&store, id, MAX_CHUNKS, 0, "").await;
-    assert_eq!(load_snapshot(&store, id).await.unwrap().2.unwrap().len(), MAX_CHUNKS);
-    seed(&store, id, 10_000, 0, "").await;
-    let (_, _, metadata) = load_snapshot(&store, id).await.unwrap();
+    seed(store, id, MAX_CHUNKS, 0, "").await;
+    assert_eq!(load_snapshot(store, id).await.unwrap().2.unwrap().len(), MAX_CHUNKS);
+    seed(store, id, 10_000, 0, "").await;
+    let (_, _, metadata) = load_snapshot(store, id).await.unwrap();
     assert!(metadata.unwrap().len() <= 3);
     assert!(store.load_all_chunks(id).await.unwrap().len() <= 3);
 }
@@ -135,8 +135,8 @@ async fn test_bytes_and_single_event_limits_are_enforced_on_reopen() {
         (1, 1, "x".repeat(MAX_EVENT_BYTES)),
         (1, 300, "oversized legacy chunk".into()),
     ] {
-        seed(&store, id, chunks, items, &body).await;
-        let chunk = load(&store, id).await.unwrap();
+        seed(store, id, chunks, items, &body).await;
+        let chunk = load(store, id).await.unwrap();
         validate(chunk.events().map(|(_, e)| e)).unwrap();
         assert!(chunk.events().count() <= KEEP_EVENTS);
         assert!(store.load_all_chunks(id).await.unwrap().len() <= 3);
@@ -149,8 +149,8 @@ async fn test_compaction_bounds_unloaded_ordering_metadata() {
     let guard = client.event_cache_store().lock().await.unwrap();
     let store = guard.as_clean().unwrap();
     let id = LinkedChunkId::Room(room_id!("!budget:example.org"));
-    seed(&store, id, 4, 128, "old").await;
-    let mut chunk = load(&store, id).await.unwrap();
+    seed(store, id, 4, 128, "old").await;
+    let mut chunk = load(store, id).await.unwrap();
     let new = EventFactory::new()
         .room(id.room_id())
         .sender(user_id!("@budget:example.org"))
@@ -171,8 +171,8 @@ async fn test_clear_leaves_no_empty_persisted_chunk_and_accepts_new_events() {
     let guard = client.event_cache_store().lock().await.unwrap();
     let store = guard.as_clean().unwrap();
     let id = LinkedChunkId::Room(room_id!("!budget:example.org"));
-    seed(&store, id, 1, 0, "").await;
-    let mut chunk = load(&store, id).await.unwrap();
+    seed(store, id, 1, 0, "").await;
+    let mut chunk = load(store, id).await.unwrap();
     assert!(store.load_all_chunks(id).await.unwrap().is_empty());
     let new = EventFactory::new()
         .room(id.room_id())
@@ -182,7 +182,7 @@ async fn test_clear_leaves_no_empty_persisted_chunk_and_accepts_new_events() {
         .into_event();
     chunk.push_live_events(None, &[new]);
     store.handle_linked_chunk_updates(id, chunk.store_updates().take()).await.unwrap();
-    assert_eq!(load(&store, id).await.unwrap().events().count(), 1);
+    assert_eq!(load(store, id).await.unwrap().events().count(), 1);
 }
 
 #[cfg(feature = "e2e-encryption")]
@@ -194,11 +194,11 @@ async fn test_stored_retry_scan_is_bounded_without_erasing_other_windows() {
     let room = room_id!("!budget:example.org");
     let thread = event_id!("$thread");
     let unopened = LinkedChunkId::Thread(room, event_id!("$unopened"));
-    seed(&store, LinkedChunkId::Room(room), 10_000, 1, "legacy room").await;
-    seed(&store, LinkedChunkId::Thread(room, thread), 2, 1, "active thread").await;
-    seed(&store, unopened, 100, 1, "unopened").await;
+    seed(store, LinkedChunkId::Room(room), 10_000, 1, "legacy room").await;
+    seed(store, LinkedChunkId::Thread(room, thread), 2, 1, "active thread").await;
+    seed(store, unopened, 100, 1, "unopened").await;
     let events = stored_events(
-        &store,
+        store,
         &[
             OwnedLinkedChunkId::Room(room.to_owned()),
             OwnedLinkedChunkId::Thread(room.to_owned(), thread.to_owned()),
@@ -210,7 +210,7 @@ async fn test_stored_retry_scan_is_bounded_without_erasing_other_windows() {
     .unwrap();
     assert_eq!(events.len(), MAX_EVENTS + 2);
     let all_types = stored_events(
-        &store,
+        store,
         &[OwnedLinkedChunkId::Thread(room.to_owned(), thread.to_owned())],
         None,
         None,
@@ -248,7 +248,7 @@ async fn test_oversized_event_is_a_boundary_not_a_hidden_hole() {
         )
         .await
         .unwrap();
-    let chunk = load(&store, id).await.unwrap();
+    let chunk = load(store, id).await.unwrap();
     let ids: Vec<_> = chunk.events().map(|(_, e)| e.event_id().unwrap().to_owned()).collect();
     assert_eq!(
         ids,

@@ -571,6 +571,18 @@ impl Client {
         ClientBuilder::new()
     }
 
+    /// Return an opaque weak reference to this client's original shared state.
+    ///
+    /// Keeping it in an idle callback does not retain the client, its stores or
+    /// background work. [`WeakClient::get`] temporarily acquires a strong
+    /// reference if any strong owner still exists. Active operations must
+    /// retain their own strong client until their original IO really
+    /// finishes; a weak reference is neither a cancellation barrier nor an
+    /// authorization check.
+    pub fn downgrade(&self) -> WeakClient {
+        WeakClient::from_client(self)
+    }
+
     pub(crate) fn base_client(&self) -> &BaseClient {
         &self.inner.base_client
     }
@@ -3979,10 +3991,16 @@ impl Client {
     }
 }
 
-/// A weak reference to the inner client, useful when trying to get a handle
-/// on the owning client.
+/// An opaque weak reference to a [`Client`]'s original shared state.
+///
+/// Created by [`Client::downgrade`] or [`Self::from_client`], this does not
+/// keep client resources alive. [`Self::get`] upgrades the same inner state
+/// while a strong owner (including active background work) remains. Once the
+/// last strong reference is gone it returns `None`; cloning a weak reference
+/// cannot revive it. Callers must separately check their account/session
+/// authority.
 #[derive(Clone, Debug)]
-pub(crate) struct WeakClient {
+pub struct WeakClient {
     client: Weak<ClientInner>,
 }
 
@@ -3992,12 +4010,15 @@ impl WeakClient {
         Self { client: Arc::downgrade(client) }
     }
 
-    /// Construct a [`WeakClient`] from a [`Client`].
+    /// Construct a weak reference to the client's original shared state,
+    /// without adding a strong owner. Equivalent to [`Client::downgrade`].
     pub fn from_client(client: &Client) -> Self {
         Self::from_inner(&client.inner)
     }
 
-    /// Attempts to get a [`Client`] from this [`WeakClient`].
+    /// Temporarily acquire a strong handle to the original client, or `None`
+    /// after its last strong owner has gone. Success alone does not authorize
+    /// work for an account or session that has since retired.
     pub fn get(&self) -> Option<Client> {
         self.client.upgrade().map(|inner| Client { inner })
     }
@@ -4005,7 +4026,7 @@ impl WeakClient {
     /// Gets the number of strong (`Arc`) pointers still pointing to this
     /// client.
     #[allow(dead_code)]
-    pub fn strong_count(&self) -> usize {
+    pub(crate) fn strong_count(&self) -> usize {
         self.client.strong_count()
     }
 }
@@ -4518,6 +4539,39 @@ pub(crate) mod tests {
 
         // And the last tracked room should be the first
         assert_eq!(rooms.first().unwrap(), "!19:localhost");
+    }
+
+    #[async_test]
+    async fn test_public_weak_client_preserves_identity_and_last_strong_lifetime() {
+        // No login, discovery or network request: explicit homeserver and
+        // versions create a real, unlogged SDK Client with in-memory stores.
+        let client = Client::builder()
+            .homeserver_url("https://weak-client.example.invalid")
+            .server_versions([MatrixVersion::V1_0])
+            .build()
+            .await
+            .unwrap();
+        let weak: WeakClient = client.downgrade();
+        let weak_clone = weak.clone();
+        let from_public_constructor = WeakClient::from_client(&client);
+        assert_eq!(Arc::strong_count(&client.inner), 1, "weak handles must not add a strong owner");
+        let upgraded = weak.get().unwrap();
+        assert!(
+            Arc::ptr_eq(&client.inner, &upgraded.inner),
+            "upgrade must retain actual SDK Client identity, not a new Arc<Client> wrapper"
+        );
+        assert_eq!(client.homeserver(), upgraded.homeserver());
+        let clone = client.clone();
+        drop(client);
+        drop(upgraded);
+        let upgraded = weak_clone.get().expect("the original client clone remains alive");
+        assert!(Arc::ptr_eq(&clone.inner, &upgraded.inner));
+        drop(upgraded);
+        assert_eq!(Arc::strong_count(&clone.inner), 1);
+        drop(clone);
+        assert!(weak.get().is_none());
+        assert!(weak_clone.get().is_none());
+        assert!(from_public_constructor.get().is_none());
     }
 
     #[async_test]
