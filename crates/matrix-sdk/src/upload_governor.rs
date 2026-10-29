@@ -611,6 +611,12 @@ fn classify_closed_http(error: crate::Error, admissions: u64) -> crate::Error {
             _ => false,
         }
     }
+    if matches!(&error, crate::Error::Http(error) if matches!(error.as_ref(), crate::HttpError::UploadResponseTooLarge { .. }))
+    {
+        // A POST was admitted but its bounded response supplies no trusted
+        // upload receipt. Persist unknown rather than automatically resending.
+        return UploadGovernorError::OutcomeUnknown.into();
+    }
     if matches!(&error, crate::Error::Http(error) if closed(error)) {
         if admissions == 0 {
             UploadGovernorError::Paused.into()
@@ -627,17 +633,69 @@ impl UploadGovernorError {
         matches!(self, Self::OutcomeUnknown | Self::WorkerFailed)
     }
 }
+// A fresh receipt distinguishes separate unknown attempts of the same outbox
+// transaction. The safe message and receipt are persisted together using the
+// existing GenericApiError representation; no payload or credential is encoded.
+pub(crate) fn persist_unknown(error: crate::Error) -> crate::Error {
+    let message = match &error {
+        crate::Error::UploadGovernor(UploadGovernorError::OutcomeUnknown) => {
+            UNKNOWN_OUTCOME_MESSAGE
+        }
+        crate::Error::UploadGovernor(UploadGovernorError::WorkerFailed) => UNKNOWN_WORKER_MESSAGE,
+        _ => return error,
+    };
+    let receipt = ruma::TransactionId::new();
+    crate::Error::SendQueueWedgeError(Box::new(
+        matrix_sdk_base::store::QueueWedgeError::GenericApiError {
+            msg: format!("{message} [hagency-upload-receipt-v1:{receipt}]"),
+        },
+    ))
+}
+
+pub(crate) fn unknown_wedge_receipt(
+    error: &matrix_sdk_base::store::QueueWedgeError,
+) -> Option<&str> {
+    let matrix_sdk_base::store::QueueWedgeError::GenericApiError { msg } = error else {
+        return None;
+    };
+    if msg == UNKNOWN_OUTCOME_MESSAGE || msg == UNKNOWN_WORKER_MESSAGE {
+        // Compatibility with unknown rows produced before per-attempt receipts.
+        return Some(msg);
+    }
+    let (message, receipt) = msg.split_once(" [hagency-upload-receipt-v1:")?;
+    if message != UNKNOWN_OUTCOME_MESSAGE && message != UNKNOWN_WORKER_MESSAGE {
+        return None;
+    }
+    let receipt = receipt.strip_suffix(']')?;
+    // The pinned Ruma generator uses a 32-digit simple UUID. This is a narrow
+    // versioned marker, never a substring match on arbitrary server errors.
+    (receipt.len() == 32 && receipt.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(msg.as_str())
+}
+
+/// Opaque confirmation receipt for one persisted unknown upload failure.
+/// Live send-queue errors and their restored durable representation carry the
+/// same receipt. Retain it with the original SendHandle and use
+/// [`crate::send_queue::SendHandle::unwedge_if_current_error`] to reject a
+/// later unknown failure under the original queue lock. Direct,
+/// not-yet-persisted transport errors have no receipt. Legacy unknown rows
+/// remain recognizable.
+pub fn unknown_upload_receipt(error: &crate::Error) -> Option<&str> {
+    match error {
+        crate::Error::SendQueueWedgeError(error) => unknown_wedge_receipt(error),
+        _ => None,
+    }
+}
+
 /// Recognize an opt-in unknown original upload outcome, including its existing
 /// durable GenericApiError representation after restoration. A host must ask
-/// for explicit confirmation before unwedging this request; enabling a queue
-/// alone must not retry it. No authentication failure is matched here.
+/// for explicit confirmation before conditionally unwedging this request;
+/// enabling a queue alone must not retry it. No authentication failure is
+/// matched.
 pub fn is_unknown_upload(error: &crate::Error) -> bool {
     match error {
         crate::Error::UploadGovernor(policy) => policy.requires_explicit_retry(),
-        crate::Error::SendQueueWedgeError(wedge) => {
-            matches!(wedge.as_ref(), matrix_sdk_base::store::QueueWedgeError::GenericApiError { msg } if msg == UNKNOWN_OUTCOME_MESSAGE || msg == UNKNOWN_WORKER_MESSAGE)
-        }
-        _ => false,
+        _ => unknown_upload_receipt(error).is_some(),
     }
 }
 

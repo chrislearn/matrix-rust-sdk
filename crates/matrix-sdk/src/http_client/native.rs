@@ -30,7 +30,10 @@ use reqwest::tls;
 use ruma::api::{IncomingResponseExt as _, OutgoingRequest, error::FromHttpResponseError};
 use tracing::{debug, info, warn};
 
-use super::{DEFAULT_REQUEST_TIMEOUT, HttpClient, TransmissionProgress, response_to_http_response};
+use super::{
+    DEFAULT_REQUEST_TIMEOUT, HttpClient, TransmissionProgress, bounded_upload_response,
+    response_to_http_response,
+};
 use crate::{
     HttpResult,
     config::RequestConfig,
@@ -78,12 +81,15 @@ impl HttpClient {
             timeout: Option<Duration>,
             retry_count: &AtomicU64,
             send_progress: SharedObservable<TransmissionProgress>,
+            response_limit: Option<usize>,
         ) -> HttpResult<http::Response<Bytes>> {
             let num_attempt = retry_count.fetch_add(1, Ordering::SeqCst);
             debug!(num_attempt, "Sending request");
             let before = ruma::time::Instant::now();
 
-            let response = execute_request(http_client, request, timeout, send_progress).await?;
+            let response =
+                execute_request(http_client, request, timeout, send_progress, response_limit)
+                    .await?;
 
             let request_duration = ruma::time::Instant::now().saturating_duration_since(before);
 
@@ -158,6 +164,7 @@ impl HttpClient {
                     config.timeout,
                     &retry_count,
                     send_progress,
+                    self.body_owner.as_ref().map(|_| 64 * 1024),
                 )
                 .await?;
                 let (parts, body) = response.into_parts();
@@ -249,6 +256,7 @@ pub(super) async fn execute_request(
     request: &http::Request<Bytes>,
     timeout: Option<Duration>,
     send_progress: SharedObservable<TransmissionProgress>,
+    response_limit: Option<usize>,
 ) -> Result<http::Response<Bytes>, HttpError> {
     use std::convert::Infallible;
 
@@ -290,7 +298,11 @@ pub(super) async fn execute_request(
     };
 
     let response = client.execute(request).await?;
-    Ok(response_to_http_response(response).await?)
+    if let Some(limit) = response_limit {
+        bounded_upload_response(response, limit).await
+    } else {
+        Ok(response_to_http_response(response).await?)
+    }
 }
 
 struct BytesChunks {

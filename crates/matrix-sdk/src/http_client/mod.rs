@@ -291,6 +291,33 @@ async fn response_to_http_response(
     Ok(http_builder.body(body).expect("Can't construct a response using the given body"))
 }
 
+/// Only original governed upload POST responses use this incremental bound.
+/// Metadata/version/sync responses retain their existing behavior (R18).
+#[cfg(not(target_family = "wasm"))]
+async fn bounded_upload_response(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> HttpResult<http::Response<Bytes>> {
+    let exceeded = || HttpError::UploadResponseTooLarge { max_bytes };
+    if response.content_length().is_some_and(|length| length > max_bytes as u64) {
+        return Err(exceeded());
+    }
+    let mut builder = http::Response::builder().status(response.status());
+    for (key, value) in response.headers_mut().drain() {
+        if let Some(key) = key {
+            builder.headers_mut().expect("response builder headers").insert(key, value);
+        }
+    }
+    let mut bytes = Vec::with_capacity(max_bytes);
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+            return Err(exceeded());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(builder.body(Bytes::from(bytes)).expect("valid original response builder"))
+}
+
 /// Marker trait to identify the authentication schemes that the
 /// [`Client`](crate::Client) supports.
 ///

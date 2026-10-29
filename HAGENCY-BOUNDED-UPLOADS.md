@@ -5,8 +5,8 @@ default remains `None`; a native host opts in and shares the same Arc across all
 its clients. Construction is read-only: the single owned OS worker starts with
 its first actual job. This is bounded buffering, **not streaming**.
 
-Defaults admit individual main files and thumbnails up to 64MiB, one active
-original operation, sixteen accepted jobs including active, and 128MiB total
+Defaults admit individual main files and thumbnails up to 64 MiB, one active
+original operation, sixteen accepted jobs including active, and 128 MiB total
 incoming cache-write bytes. The sixteen-job limit covers Governor transfer
 metadata, not existing per-Room SDK tasks, durable outbox metadata, caller-owned
 inputs, or persistent cache retention. Hosts must still bound source preparation.
@@ -38,10 +38,31 @@ false permanent MissingMediaContent wedge and require explicit resume. Unknown
 transport or original-worker outcomes instead persist the existing
 GenericApiError wedge with a stable safe message: restart/set_enabled alone
 cannot resend them. The host uses is_unknown_upload on typed or restored errors
-and asks for explicit confirmation before SendHandle::unwedge. Existing outbox cancellation and already-started pause semantics remain.
+and asks for explicit confirmation before SendHandle::unwedge_if_current_error.
+Each new unknown failure has a non-secret per-attempt receipt in the existing
+GenericApiError message. Its live and restored errors carry the same receipt.
+The conditional API holds the original Room queue store lock, checks all current
+main/thumbnail/event statuses before any clear, and refuses a successor unknown
+or an already active original request. Ordinary retries pass None and refuse any
+current related unknown. Legacy SendHandle::unwedge remains unconditional for
+compatibility; this is not a cross-process SQLite compare-and-swap guarantee.
+The restart/enable guarantee applies after the Unknown status is durably
+recorded. A process crash or persistence failure between the HTTP side effect
+and its status commit remains an existing uncertainty window; this is not
+exactly-once delivery or a new pre-POST intent protocol.
+Existing outbox cancellation and already-started pause semantics remain.
 An incoming cache-write can fail before an outbox row exists; the error does not
 claim a pending row was created. Optional duplicate-thumbnail recache remains
 best effort and logs a bounded rejection rather than reading unlimited data.
+
+Only original governed media POST responses have an additional 64 KiB response
+body limit: declared Content-Length is checked before collection and actual
+chunks are counted before appending. An oversized POST response yields durable
+Unknown because there is no trusted media receipt; it cannot trigger automatic
+retry. No whole Client cap is introduced. R18 remains open: /versions,
+/media/config and encryption-state preflight metadata responses still use the
+SDK's existing general response collector. The soak uses trusted bounded metadata
+and does not prove an adversarial end-to-end memory bound.
 
 The client-wide HTTP request fence and optional request scope are preserved.
 RequestConfig::short_retry does not replace either fence. Quota ownership adds no
@@ -62,18 +83,18 @@ interactive UI handler.
 
 ## Memory scope and qualification
 
-A 64MiB limit bounds accepted source bytes, not total memory. SQLite native row
+A 64 MiB limit bounds accepted source bytes, not total memory. SQLite native row
 buffers and page cache are additional to Rust vectors. Prior real bundled SQLite
-3.53.2 measurements observed roughly 256.16MiB native allocation high-water for
-an accepted 64MiB row; that observation is not a portable multiplier or hard RSS
+3.53.2 measurements observed roughly 256.16 MiB native allocation high-water for
+an accepted 64 MiB row; that observation is not a portable multiplier or hard RSS
 bound. Encryption, Ruma serialization, request clones and HTTP buffering are
 also additional to a source vector. No counter proves a heap or RSS bound.
 
-The App release probe uses eight fresh-process workloads: 16/64MiB x 1/20 restored
-Rooms x plain/encrypted attachment uploads. Fixture generation uses 64KiB blocks;
+The App release probe uses eight fresh-process workloads: 16/64 MiB x 1/20 restored
+Rooms x plain/encrypted attachment uploads. Fixture generation uses 64 KiB blocks;
 whole SDK cache fixture writes occur in a separate setup process. After SDK
-warmup, the fixed Rust heap gate is 512MiB, and the exact measured child's
-whole-lifetime OS RSS gate is 1GiB. Raw results, source/binary fingerprints and
+warmup, the fixed Rust heap gate is 512 MiB, and the exact measured child's
+whole-lifetime OS RSS gate is 1 GiB. Raw results, source/binary fingerprints and
 failing fixtures are retained. Final encrypted event sending and E2EE room-key
 exchange are outside this soak window; actual final event transaction and
 thumbnail cache formats are covered by separate real SDK regression tests.

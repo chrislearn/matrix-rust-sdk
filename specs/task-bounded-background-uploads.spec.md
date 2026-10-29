@@ -12,11 +12,12 @@ format while bounding original file-buffer jobs. This is not streaming.
 ## Constraints
 
 ### Must
-- Keep default SDK paths behavior-compatible and the original64MiB accepted App source size.
-- Limit one active owned operation sixteen accepted metadata jobs including active and128MiB queued cache-write payload; bounded reads cover main thumbnails restore and post-upload thumbnail recache.
+- Keep default SDK paths behavior-compatible and the original 64 MiB accepted App source size.
+- Limit one active owned operation sixteen accepted metadata jobs including active and 128 MiB queued cache-write payload; bounded reads cover main thumbnails restore and post-upload thumbnail recache.
+- Bound only original governed upload POST response bodies to 64 KiB with Content-Length preflight and actual incremental chunk accounting; oversized responses after POST admission become durable Unknown. General metadata responses remain a separately recorded R18.
 - Await original SQLite work to actual return even if observers disappear; move synchronous attachment encryption off Tokio workers and keep actual serialized HTTP Bytes owners charged until release.
 - Keep existing client-wide and per-request fences intact; RequestConfig overrides must not erase them or change automatic token refresh.
-- Unknown original transport or worker outcomes persist the existing GenericApiError wedge with safe stable messages and retain the original transaction until explicit confirmed unwedge; queue enabling or restart must not resend them.
+- Unknown original transport or worker outcomes persist the existing GenericApiError wedge with safe stable messages and unique non-secret per-failure receipts and retain the original transaction until explicit confirmed unwedge; queue enabling or restart must not resend them.
 - Capacity defers and wakes without dropping or wedging durable rows; over-limit or unsupported stores report accurate recoverable paused errors without MissingMediaContent substitution.
 - Preserve original pause semantics: queued work not started may defer, already started work may finish its original status; no credential or account protocol redesign.
 - Fail closed and retain unknown charged custody on original worker failure instead of pretending IO completion.
@@ -81,7 +82,7 @@ Scenario: Global fences and default behavior remain compatible
     Test Double: actual client HTTP admission refresh and queue APIs
   Given default clients shared governed clients request overrides and retirement
   When media and other requests execute
-  Then default SDK behavior and client-wide HTTP fences remain while automatic401 refresh is not suppressed by quota ownership
+  Then default SDK behavior and client-wide HTTP fences remain while automatic 401 refresh is not suppressed by quota ownership
 
 Scenario: Original HTTP result carries its client through durable receipt commit
   Test:
@@ -92,3 +93,29 @@ Scenario: Original HTTP result carries its client through durable receipt commit
   Given a real original upload result and no remaining external client owner
   When default or governed handling commits the original durable receipt
   Then the result lease preserves the client until commit succeeds and releases it afterward without another send
+
+Scenario: Original governed POST responses stop at the actual incremental bound
+  Test:
+    Package: matrix-sdk
+    Filter: upload_governor::tests::responses
+    Level: integration
+    Test Double: actual raw HTTP declared and chunked bodies including a false length header
+  Given original media POSTs and large peer response bodies
+  When declared length or actual chunks exceed 64 KiB
+  Then the original transfer is retained as durable unknown without collecting the full body or automatically retrying
+
+Scenario: Conditional retry rejects replacement failures under the original queue lock
+  Test:
+    Package: matrix-sdk
+    Filter: send_queue::tests::conditional_unknown_retry
+    Level: integration
+    Test Double: actual SQLite outbox and original Room queue lock with controlled status replacement
+  Given a confirmed unknown receipt or an ordinary stale known-failure retry
+  When a newer unknown main or thumbnail status is committed while that operation waits for the original queue lock
+  Then every related status is checked before any clear the newer receipt and original transactions remain and no HTTP starts
+
+## Decisions
+
+The Governor branch began at 3ccd3851562b1dee920a6d9f3e40bfd77fe3d279 and additionally merges the separately reviewed SDK4 source 95de9a4e393921c446b2b79e5d72ad09411ef586 before final validation. SDK4 source changes are an inherited dependency prerequisite, not this Governor implementation's boundary delta.
+
+R18 remains open: /versions, /media/config and encryption-state preflight metadata responses use the existing general SDK response collector. The upload soak uses trusted bounded metadata responses and cannot qualify an adversarial end-to-end process-memory bound. No global Client response cap or new request_scope is added.

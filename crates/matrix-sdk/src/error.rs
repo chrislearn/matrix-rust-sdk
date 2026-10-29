@@ -67,6 +67,15 @@ pub enum HttpError {
     /// The host retired or expired this request's authority before HTTP IO.
     #[error("host HTTP request authority is unavailable")]
     RequestFenceClosed,
+
+    /// A governed upload response exceeded its bounded JSON response budget.
+    #[cfg(not(target_family = "wasm"))]
+    #[error("Upload response exceeds the safe limit of {max_bytes} bytes")]
+    UploadResponseTooLarge {
+        /// Maximum accepted response body bytes for the original upload.
+        max_bytes: usize,
+    },
+
     /// Error at the HTTP layer.
     #[error(transparent)]
     Reqwest(#[from] ReqwestError),

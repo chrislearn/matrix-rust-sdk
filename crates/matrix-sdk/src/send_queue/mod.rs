@@ -1056,6 +1056,8 @@ impl RoomSendQueue {
                 }
 
                 Err(err) => {
+                    #[cfg(not(target_family = "wasm"))]
+                    let err = crate::upload_governor::persist_unknown(err);
                     let is_recoverable = match err {
                         crate::Error::Http(ref http_err) => {
                             // All transient errors are recoverable.
@@ -1071,7 +1073,9 @@ impl RoomSendQueue {
                         // we'll get the actual underlying error.
                         crate::Error::ConcurrentRequestFailed => true,
                         #[cfg(not(target_family = "wasm"))]
-                        crate::Error::UploadGovernor(ref policy) => !policy.requires_explicit_retry(),
+                        crate::Error::UploadGovernor(ref policy) => {
+                            !policy.requires_explicit_retry()
+                        }
 
                         // As of 2024-06-27, all other error types are considered unrecoverable.
                         _ => false,
@@ -3173,6 +3177,88 @@ impl SendHandle {
         }
     }
 
+    /// Conditionally retry the original request under its Room queue's store
+    /// lock. `None` is an ordinary retry and refuses any current related
+    /// unknown upload. `Some` must equal every current unknown receipt
+    /// among the event, main file and thumbnails; a different/new failure
+    /// refuses the entire operation before any status write. Returns false
+    /// for stale confirmation, missing requests or an already active
+    /// original request.
+    ///
+    /// Use [`crate::upload_governor::unknown_upload_receipt`] after explicit
+    /// user confirmation. This coordinates this original Room queue, not
+    /// independent processes writing the same store. The legacy
+    /// [`Self::unwedge`] API keeps its unconditional behavior for existing
+    /// hosts.
+    #[cfg(not(target_family = "wasm"))]
+    pub async fn unwedge_if_current_error(
+        &self,
+        confirmed_unknown: Option<&str>,
+    ) -> Result<bool, RoomSendQueueError> {
+        let room = &self.room.inner;
+        let guard = room.queue.store.lock().await;
+        let client = guard.client()?;
+        let store = client.state_store();
+        let rows = store
+            .load_send_queue_requests(&room.queue.room_id)
+            .await
+            .map_err(RoomSendQueueStorageError::from)?;
+        let mut transactions = vec![self.transaction_id.clone()];
+        for handles in &self.media_handles {
+            transactions.push(handles.upload_file_txn.clone());
+            transactions.extend(handles.upload_thumbnail_txn.iter().cloned());
+        }
+        // Current media children must be checked even when an older immutable
+        // handle did not contain them. Dependent requests have no wedge field.
+        for row in &rows {
+            if matches!(&row.kind, QueuedRequestKind::MediaUpload { related_to, .. }
+                if related_to == &self.transaction_id)
+            {
+                transactions.push(row.transaction_id.clone());
+            }
+        }
+        transactions.sort();
+        transactions.dedup();
+        if guard
+            .being_sent
+            .as_ref()
+            .is_some_and(|active| transactions.contains(&active.transaction_id))
+        {
+            return Ok(false);
+        }
+        let related = rows.iter().filter(|row| transactions.contains(&row.transaction_id));
+        let mut found = false;
+        let mut found_unknown = false;
+        for row in related {
+            found = true;
+            if let Some(receipt) =
+                row.error.as_ref().and_then(crate::upload_governor::unknown_wedge_receipt)
+            {
+                found_unknown = true;
+                if confirmed_unknown != Some(receipt) {
+                    return Ok(false);
+                }
+            }
+        }
+        if !found || (confirmed_unknown.is_some() && !found_unknown) {
+            return Ok(false);
+        }
+        // All related state is validated before the first write, while the
+        // same original queue lock also excludes its sending/status actor.
+        for transaction in &transactions {
+            store
+                .update_send_queue_request_status(&room.queue.room_id, transaction, None)
+                .await
+                .map_err(RoomSendQueueStorageError::from)?;
+        }
+        drop(guard);
+        room.notifier.notify_one();
+        self.room.send_update(RoomSendQueueUpdate::RetryEvent {
+            transaction_id: self.transaction_id.clone(),
+        });
+        Ok(true)
+    }
+
     /// Unwedge a local echo identified by its transaction identifier and try to
     /// resend it.
     pub async fn unwedge(&self) -> Result<(), RoomSendQueueError> {
@@ -3786,5 +3872,134 @@ mod tests {
             .expect("receipt committed before last client lease released");
             assert_eq!(governor.stats().jobs, 0);
         }
+    }
+    #[tokio::test]
+    async fn conditional_unknown_retry_checks_all_original_sqlite_rows_after_lock_wait() {
+        use std::time::Duration;
+
+        use matrix_sdk_base::store::{QueueWedgeError, QueuedRequestKind};
+
+        use crate::{
+            attachment::{AttachmentConfig, Thumbnail},
+            test_utils::mocks::MatrixMockServer,
+            upload_governor::{UploadGovernorError, persist_unknown, unknown_upload_receipt},
+        };
+        let mock = MatrixMockServer::new().await;
+        let directory = tempfile::tempdir().unwrap();
+        let client = mock
+            .client_builder()
+            .on_builder(|builder| builder.sqlite_store(directory.path(), None))
+            .build()
+            .await;
+        client.send_queue().set_enabled(false).await;
+        let room = mock.sync_joined_room(&client, room_id!("!conditional-retry:test")).await;
+        let queue = room.send_queue();
+        let handle = queue
+            .send_attachment(
+                "source",
+                mime::IMAGE_JPEG,
+                vec![7; 16],
+                AttachmentConfig::new().thumbnail(Some(Thumbnail {
+                    data: vec![3; 8],
+                    content_type: mime::IMAGE_JPEG,
+                    height: ruma::uint!(2),
+                    width: ruma::uint!(4),
+                    size: ruma::uint!(8),
+                })),
+            )
+            .await
+            .unwrap();
+        let handles = &handle.media_handles[0];
+        let file_txn = &handles.upload_file_txn;
+        let thumb_txn = handles.upload_thumbnail_txn.as_ref().unwrap();
+        let store = client.state_store();
+        let rows = store.load_send_queue_requests(room.room_id()).await.unwrap();
+        let QueuedRequestKind::MediaUpload { content_type, cache_key, .. } = &rows[0].kind else {
+            panic!("actual original attachment upload")
+        };
+        // Materialize the original dependent main request as an actual SQLite
+        // row so both current statuses must be validated before either clear.
+        store
+            .save_send_queue_request(
+                room.room_id(),
+                file_txn.clone(),
+                MilliSecondsSinceUnixEpoch::now(),
+                QueuedRequestKind::MediaUpload {
+                    content_type: content_type.clone(),
+                    cache_key: cache_key.clone(),
+                    thumbnail_source: None,
+                    related_to: handle.transaction_id.clone(),
+                    #[cfg(feature = "unstable-msc4274")]
+                    accumulated: vec![],
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        let a = persist_unknown(UploadGovernorError::OutcomeUnknown.into());
+        let b = persist_unknown(UploadGovernorError::OutcomeUnknown.into());
+        let receipt_a = unknown_upload_receipt(&a).unwrap();
+        let receipt_b = unknown_upload_receipt(&b).unwrap();
+        assert_ne!(receipt_a, receipt_b, "same txn's distinct failures need distinct receipts");
+        let error_a = QueueWedgeError::from(&a);
+        let error_b = QueueWedgeError::from(&b);
+        let baseline = mock.received_requests().await.unwrap().len();
+        for expected in [Some(receipt_a), None] {
+            store
+                .update_send_queue_request_status(
+                    room.room_id(),
+                    thumb_txn,
+                    Some(if expected.is_some() {
+                        error_a.clone()
+                    } else {
+                        QueueWedgeError::GenericApiError { msg: "known failure".into() }
+                    }),
+                )
+                .await
+                .unwrap();
+            store
+                .update_send_queue_request_status(room.room_id(), file_txn, Some(error_a.clone()))
+                .await
+                .unwrap();
+            let guard = queue.inner.queue.store.lock().await;
+            let mut retry = Box::pin(handle.unwedge_if_current_error(expected));
+            assert!(
+                futures_util::poll!(&mut retry).is_pending(),
+                "actual public operation waits on the original queue lock"
+            );
+            // A successor unknown arrives in that exact original lock window,
+            // before the pending operation can inspect persisted status.
+            store
+                .update_send_queue_request_status(room.room_id(), thumb_txn, Some(error_b.clone()))
+                .await
+                .unwrap();
+            drop(guard);
+            assert!(!tokio::time::timeout(Duration::from_secs(5), retry).await.unwrap().unwrap());
+            let rows = store.load_send_queue_requests(room.room_id()).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().any(|row| row.transaction_id == *thumb_txn
+                && row.error.as_ref().and_then(crate::upload_governor::unknown_wedge_receipt)
+                    == Some(receipt_b)));
+            assert!(
+                rows.iter().any(|row| row.transaction_id == *file_txn
+                    && row.error.as_ref().and_then(crate::upload_governor::unknown_wedge_receipt)
+                        == Some(receipt_a)),
+                "reject before partially clearing another related row"
+            );
+            assert_eq!(
+                mock.received_requests().await.unwrap().len(),
+                baseline,
+                "stale confirmation and ordinary stale retry create no HTTP"
+            );
+        }
+        store
+            .update_send_queue_request_status(room.room_id(), thumb_txn, Some(error_a))
+            .await
+            .unwrap();
+        assert!(handle.unwedge_if_current_error(Some(receipt_a)).await.unwrap());
+        let rows = store.load_send_queue_requests(room.room_id()).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.error.is_none()));
+        assert_eq!(mock.received_requests().await.unwrap().len(), baseline);
     }
 }
