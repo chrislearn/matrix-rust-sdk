@@ -16,6 +16,7 @@ format while bounding original file-buffer jobs. This is not streaming.
 - Limit one active owned operation sixteen accepted metadata jobs including active and128MiB queued cache-write payload; bounded reads cover main thumbnails restore and post-upload thumbnail recache.
 - Await original SQLite work to actual return even if observers disappear; move synchronous attachment encryption off Tokio workers and keep actual serialized HTTP Bytes owners charged until release.
 - Keep existing client-wide and per-request fences intact; RequestConfig overrides must not erase them or change automatic token refresh.
+- Unknown original transport or worker outcomes persist the existing GenericApiError wedge with safe stable messages and retain the original transaction until explicit confirmed unwedge; queue enabling or restart must not resend them.
 - Capacity defers and wakes without dropping or wedging durable rows; over-limit or unsupported stores report accurate recoverable paused errors without MissingMediaContent substitution.
 - Preserve original pause semantics: queued work not started may defer, already started work may finish its original status; no credential or account protocol redesign.
 - Fail closed and retain unknown charged custody on original worker failure instead of pretending IO completion.
@@ -81,3 +82,13 @@ Scenario: Global fences and default behavior remain compatible
   Given default clients shared governed clients request overrides and retirement
   When media and other requests execute
   Then default SDK behavior and client-wide HTTP fences remain while automatic401 refresh is not suppressed by quota ownership
+
+Scenario: Original HTTP result carries its client through durable receipt commit
+  Test:
+    Package: matrix-sdk
+    Filter: send_queue::tests::governed_receipt_and_default_result
+    Level: integration
+    Test Double: actual HTTP SQLite and controlled idle automatic observer
+  Given a real original upload result and no remaining external client owner
+  When default or governed handling commits the original durable receipt
+  Then the result lease preserves the client until commit succeeds and releases it afterward without another send

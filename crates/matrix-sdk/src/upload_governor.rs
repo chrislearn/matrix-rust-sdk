@@ -42,6 +42,12 @@ impl Default for UploadLimits {
         }
     }
 }
+// These durable GenericApiError messages are a compatibility contract. Keep old
+// strings recognizable when changing future presentation or policy versions.
+const UNKNOWN_OUTCOME_MESSAGE: &str = "Attachment transport outcome is unknown; the original pending message is retained without automatic retry";
+const UNKNOWN_WORKER_MESSAGE: &str =
+    "Original attachment IO became unknown; restart before retrying";
+
 /// Resource-policy errors never imply missing cached data or a completed send.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum UploadGovernorError {
@@ -55,9 +61,7 @@ pub enum UploadGovernorError {
         max_bytes: usize,
     },
     /// Transport admission happened before retirement; its outcome is unknown.
-    #[error(
-        "Attachment transport outcome is unknown; the original pending message is retained without automatic retry"
-    )]
+    #[error("{}", UNKNOWN_OUTCOME_MESSAGE)]
     OutcomeUnknown,
     /// A queued request has not started and its original queue is paused.
     #[error("Attachment upload is paused")]
@@ -72,7 +76,7 @@ pub enum UploadGovernorError {
     #[error("Attachment processing is stopped")]
     Stopped,
     /// An original worker failed while physical IO might still exist.
-    #[error("Original attachment IO became unknown; restart before retrying")]
+    #[error("{}", UNKNOWN_WORKER_MESSAGE)]
     WorkerFailed,
     /// Limits would not admit a regular accepted file.
     #[error("Invalid attachment admission limits")]
@@ -300,7 +304,8 @@ impl UploadGovernor {
             worker = self.worker.lock().unwrap_or_else(|e| e.into_inner());
         }
         if let Some(join) = worker.take()
-            && join.join().is_err() {
+            && join.join().is_err()
+        {
             return UploadShutdown::Pending(self.stats());
         }
         UploadShutdown::Joined(stats)
@@ -519,6 +524,7 @@ pub(crate) async fn upload_original(
 
     use crate::{Media, config::RequestConfig};
     let client = room.client();
+    let admissions = Arc::new(AtomicU64::new(0));
     custody.retain_client(&client);
     let data = bounded_content(&client, &request, limit)
         .await?
@@ -532,7 +538,12 @@ pub(crate) async fn upload_original(
         return Err(UploadGovernorError::Cancelled.into());
     }
     #[cfg(feature = "e2e-encryption")]
-    let (data, keys) = if room.latest_encryption_state().await?.is_encrypted() {
+    let (data, keys) = if room
+        .latest_encryption_state()
+        .await
+        .map_err(|error| classify_closed_http(error, admissions.load(Ordering::Acquire)))?
+        .is_encrypted()
+    {
         use std::io::Read;
         let mut encrypted = Vec::with_capacity(data.len());
         let mut cursor = std::io::Cursor::new(data);
@@ -561,7 +572,6 @@ pub(crate) async fn upload_original(
     if !live.load(Ordering::Acquire) {
         return Err(UploadGovernorError::Cancelled.into());
     }
-    let admissions = Arc::new(AtomicU64::new(0));
     let owner = crate::http_client::BodyOwner {
         // Actual serialized request Bytes retain BOTH the budget and the original
         // client/credential lease, even after the observer or HTTP future drops.
@@ -575,12 +585,9 @@ pub(crate) async fn upload_original(
     if let Some(progress) = progress {
         upload = upload.with_send_progress_observable(progress);
     }
-    let response = upload.await.map_err(|error| {
-        if matches!(&error, crate::Error::Http(error) if matches!(**error, crate::HttpError::RequestFenceClosed)) {
-            if admissions.load(Ordering::Acquire) == 0 { UploadGovernorError::Paused.into() }
-            else { UploadGovernorError::OutcomeUnknown.into() }
-        } else { error }
-    })?;
+    let response = upload
+        .await
+        .map_err(|error| classify_closed_http(error, admissions.load(Ordering::Acquire)))?;
     #[cfg(feature = "e2e-encryption")]
     if let Some(keys) = keys {
         return Ok(MediaSource::Encrypted(Box::new(ruma::events::room::EncryptedFile::new(
@@ -590,6 +597,48 @@ pub(crate) async fn upload_original(
         ))));
     }
     Ok(MediaSource::Plain(response.content_uri))
+}
+
+// Match typed original errors, including the SDK's automatic Matrix refresh
+// wrapper. Ordinary final 401/refresh401 failures retain their SDK semantics.
+fn classify_closed_http(error: crate::Error, admissions: u64) -> crate::Error {
+    fn closed(error: &crate::HttpError) -> bool {
+        match error {
+            crate::HttpError::RequestFenceClosed => true,
+            crate::HttpError::RefreshToken(crate::error::RefreshTokenError::MatrixAuth(error)) => {
+                closed(error)
+            }
+            _ => false,
+        }
+    }
+    if matches!(&error, crate::Error::Http(error) if closed(error)) {
+        if admissions == 0 {
+            UploadGovernorError::Paused.into()
+        } else {
+            UploadGovernorError::OutcomeUnknown.into()
+        }
+    } else {
+        error
+    }
+}
+
+impl UploadGovernorError {
+    pub(crate) fn requires_explicit_retry(&self) -> bool {
+        matches!(self, Self::OutcomeUnknown | Self::WorkerFailed)
+    }
+}
+/// Recognize an opt-in unknown original upload outcome, including its existing
+/// durable GenericApiError representation after restoration. A host must ask
+/// for explicit confirmation before unwedging this request; enabling a queue
+/// alone must not retry it. No authentication failure is matched here.
+pub fn is_unknown_upload(error: &crate::Error) -> bool {
+    match error {
+        crate::Error::UploadGovernor(policy) => policy.requires_explicit_retry(),
+        crate::Error::SendQueueWedgeError(wedge) => {
+            matches!(wedge.as_ref(), matrix_sdk_base::store::QueueWedgeError::GenericApiError { msg } if msg == UNKNOWN_OUTCOME_MESSAGE || msg == UNKNOWN_WORKER_MESSAGE)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

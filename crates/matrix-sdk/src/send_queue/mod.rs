@@ -479,6 +479,11 @@ impl std::fmt::Debug for RoomSendQueue {
     }
 }
 
+struct HandledRequest {
+    result: Result<(Option<SentRequestKey>, Option<EncryptionInfo>), crate::Error>,
+    _client: Option<Client>,
+}
+
 impl RoomSendQueue {
     fn new(
         globally_enabled: bool,
@@ -825,9 +830,12 @@ impl RoomSendQueue {
                 .get()
                 .and_then(|room| room.client().send_queue().upload_governor())
                 .map(|governor| governor.capacity());
-            let result =
+            let outcome =
                 Self::handle_request(&room, queued_request, cancel_upload_rx, http_progress).await;
-            // No StrongClient is retained while metadata waits for admission.
+            let result = outcome.result;
+            let original_client = outcome._client;
+            // Unadmitted metadata is weak; actual results carry their original
+            // Client lease through the original outbox commit below.
             let Some(room) = room.get() else { break };
             match result {
                 Ok((Some(parent_key), encryption_info)) => match queue
@@ -1063,7 +1071,7 @@ impl RoomSendQueue {
                         // we'll get the actual underlying error.
                         crate::Error::ConcurrentRequestFailed => true,
                         #[cfg(not(target_family = "wasm"))]
-                        crate::Error::UploadGovernor(_) => true,
+                        crate::Error::UploadGovernor(ref policy) => !policy.requires_explicit_retry(),
 
                         // As of 2024-06-27, all other error types are considered unrecoverable.
                         _ => false,
@@ -1086,7 +1094,7 @@ impl RoomSendQueue {
                     }
 
                     if is_recoverable {
-                        warn!(txn_id = %txn_id, error = ?err, "Recoverable error when sending request: {err}, disabling send queue");
+                        warn!(txn_id = %txn_id, error = ?err, "Recoverable error when sending request; original request retained: {err}");
 
                         // In this case, we intentionally keep the request in the queue, but mark it
                         // as not being sent anymore.
@@ -1131,6 +1139,7 @@ impl RoomSendQueue {
                     #[cfg(not(target_family = "wasm"))]
                     if capacity_deferred {
                         drop(room);
+                        drop(original_client);
                         if let Some(changed) = capacity_changed.as_mut() {
                             tokio::select! { _ = changed.changed() => {}, _ = notifier.notified() => {} }
                         } else {
@@ -1152,10 +1161,92 @@ impl RoomSendQueue {
         request: QueuedRequest,
         cancel_upload_rx: Option<oneshot::Receiver<()>>,
         progress: Option<SharedObservable<TransmissionProgress>>,
+    ) -> HandledRequest {
+        let Some(room) = weak_room.get() else {
+            return HandledRequest {
+                result: Err(crate::Error::UnknownError(Box::new(std::io::Error::other(
+                    "original room no longer exists",
+                )))),
+                _client: None,
+            };
+        };
+        #[cfg(not(target_family = "wasm"))]
+        if matches!(&request.kind, QueuedRequestKind::MediaUpload { .. })
+            && let Some(governor) = room.client().send_queue().upload_governor()
+        {
+            let QueuedRequestKind::MediaUpload {
+                content_type,
+                cache_key,
+                thumbnail_source,
+                #[cfg(feature = "unstable-msc4274")]
+                accumulated,
+                ..
+            } = request.kind
+            else {
+                unreachable!("media discriminant checked")
+            };
+            let weak = weak_room.clone();
+            drop(room);
+            let limit = governor.limits().max_file_bytes;
+            let operation = governor.submit(0, move |custody, live| async move {
+                let room = weak.get().ok_or(crate::upload_governor::UploadGovernorError::Paused)?;
+                let client = room.client();
+                let result = if !room.send_queue().is_enabled() {
+                    Err(crate::upload_governor::UploadGovernorError::Paused.into())
+                } else {
+                    crate::upload_governor::upload_original(
+                        &room,
+                        cache_key,
+                        content_type,
+                        progress,
+                        limit,
+                        custody,
+                        live,
+                    )
+                    .await
+                    .map(|media_source| {
+                        (
+                            Some(SentRequestKey::Media(SentMediaInfo {
+                                file: media_source,
+                                thumbnail: thumbnail_source,
+                                #[cfg(feature = "unstable-msc4274")]
+                                accumulated,
+                            })),
+                            None,
+                        )
+                    })
+                };
+                // Strong result custody crosses the original IO -> durable
+                // outbox commit boundary, even if every
+                // external owner retires meanwhile.
+                Ok::<_, crate::Error>(HandledRequest { result, _client: Some(client) })
+            });
+            let operation = match operation {
+                Ok(operation) => operation,
+                Err(error) => return HandledRequest { result: Err(error.into()), _client: None },
+            };
+            return tokio::select! {
+                biased;
+                _ = async { if let Some(rx) = cancel_upload_rx { let _ = rx.await; } else { std::future::pending::<()>().await } } => HandledRequest { result: Ok((None, None)), _client: None },
+                result = operation => match result {
+                    Ok(outcome) => outcome,
+                    Err(error) => HandledRequest { result: Err(error), _client: None },
+                },
+            };
+        }
+        // Default-off requests retain their original strong client through BOTH
+        // network result handling and durable success/error commit, as before.
+        let client = room.client();
+        let result = Self::handle_request_default(room, request, cancel_upload_rx, progress).await;
+        HandledRequest { result, _client: Some(client) }
+    }
+
+    async fn handle_request_default(
+        room: Room,
+        request: QueuedRequest,
+        cancel_upload_rx: Option<oneshot::Receiver<()>>,
+        progress: Option<SharedObservable<TransmissionProgress>>,
     ) -> Result<(Option<SentRequestKey>, Option<EncryptionInfo>), crate::Error> {
-        let room = weak_room.get().ok_or(crate::Error::UnknownError(Box::new(
-            std::io::Error::other("original room no longer exists"),
-        )))?;
         match request.kind {
             QueuedRequestKind::Event { content } => {
                 let (event, event_type) = content.into_raw();
@@ -1188,44 +1279,6 @@ impl RoomSendQueue {
             } => {
                 trace!(%relates_to, "uploading media related to event");
 
-                #[cfg(not(target_family = "wasm"))]
-                if let Some(governor) = room.client().send_queue().upload_governor() {
-                    let weak = weak_room.clone();
-                    drop(room);
-                    let limit = governor.limits().max_file_bytes;
-                    let operation = governor.submit(0, move |custody, live| async move {
-                        let room = weak
-                            .get()
-                            .ok_or(crate::upload_governor::UploadGovernorError::Paused)?;
-                        if !room.send_queue().is_enabled() {
-                            return Err(crate::upload_governor::UploadGovernorError::Paused.into());
-                        }
-                        let media_source = crate::upload_governor::upload_original(
-                            &room,
-                            cache_key,
-                            content_type,
-                            progress,
-                            limit,
-                            custody,
-                            live,
-                        )
-                        .await?;
-                        Ok((
-                            Some(SentRequestKey::Media(SentMediaInfo {
-                                file: media_source,
-                                thumbnail: thumbnail_source,
-                                #[cfg(feature = "unstable-msc4274")]
-                                accumulated,
-                            })),
-                            None,
-                        ))
-                    })?;
-                    return tokio::select! {
-                        biased;
-                        _ = async { if let Some(rx) = cancel_upload_rx { let _ = rx.await; } else { std::future::pending::<()>().await } } => Ok((None, None)),
-                        result = operation => result,
-                    };
-                }
                 let fut = async move {
                     let data = room
                         .client()
@@ -2943,6 +2996,15 @@ pub struct SendHandle {
 }
 
 impl SendHandle {
+    /// Whether two handles identify the same original request in the same
+    /// original Room queue. This performs no IO and does not upgrade a client.
+    /// A restored/replaced queue is a different request capability even if its
+    /// user, room or transaction strings happen to match.
+    pub fn is_same_request(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.room.inner, &other.room.inner)
+            && self.transaction_id == other.transaction_id
+    }
+
     /// Creates a new [`SendHandle`].
     #[cfg(test)]
     pub(crate) fn new(
@@ -3636,5 +3698,93 @@ mod tests {
         assert_eq!(res.len(), 2);
         assert_eq!(res[0].own_transaction_id, edit_id);
         assert_eq!(res[1].own_transaction_id, react_id);
+    }
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn governed_receipt_and_default_result_keep_last_client_until_original_sqlite_commit() {
+        use std::{sync::atomic::Ordering, time::Duration};
+
+        use crate::{
+            send_queue::RoomSendQueue,
+            test_utils::mocks::MatrixMockServer,
+            upload_governor::{UploadGovernor, UploadLimits},
+        };
+        for governed in [false, true] {
+            let mock = MatrixMockServer::new().await;
+            let directory = tempfile::tempdir().unwrap();
+            let governor = Arc::new(UploadGovernor::new(UploadLimits::default()).unwrap());
+            let client = mock
+                .client_builder()
+                .on_builder(|builder| {
+                    let builder = builder.sqlite_store(directory.path(), None);
+                    if governed { builder.upload_governor(governor.clone()) } else { builder }
+                })
+                .build()
+                .await;
+            client.send_queue().set_enabled(false).await;
+            let room = mock.sync_joined_room(&client, room_id!("!receipt:test")).await;
+            let queue = room.send_queue();
+            // Deterministic driver of the actual handle_request -> mark_as_sent
+            // boundary. Abort only the idle automatic observer, not original
+            // IO.
+            queue.inner._task.abort();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !queue.inner._task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let handle = queue
+                .send_attachment(
+                    "source",
+                    mime::IMAGE_JPEG,
+                    vec![7; 16],
+                    crate::attachment::AttachmentConfig::new(),
+                )
+                .await
+                .unwrap();
+            drop(handle);
+            let (request, cancel) = queue.inner.queue.peek_next_to_send().await.unwrap().unwrap();
+            let txn = request.transaction_id.clone();
+            queue.inner.locally_enabled.store(true, Ordering::SeqCst);
+            mock.mock_authenticated_media_config().ok_default().mount().await;
+            mock.mock_room_state_encryption().plain().mount().await;
+            mock.mock_upload().ok(ruma::mxc_uri!("mxc://test/receipt")).mock_once().mount().await;
+            let weak = client.downgrade();
+            let weak_room = crate::room::WeakRoom::new(weak.clone(), room.room_id().to_owned());
+            drop(room);
+            let outcome = RoomSendQueue::handle_request(&weak_room, request, cancel, None).await;
+            let (Some(parent), _) = outcome.result.unwrap() else {
+                panic!("actual original media receipt")
+            };
+            drop(client);
+            assert!(
+                weak.get().is_some(),
+                "returned original result must hold the last Client lease"
+            );
+            // This is the original real SQLite receipt commit, using only its
+            // original weak QueueStorage client plus the returned result lease.
+            queue.inner.queue.mark_as_sent(&txn, parent).await.unwrap();
+            let check = weak.get().unwrap();
+            assert!(
+                check
+                    .state_store()
+                    .load_send_queue_requests(weak_room.room_id())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            drop(check);
+            drop(outcome._client);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while weak.get().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("receipt committed before last client lease released");
+            assert_eq!(governor.stats().jobs, 0);
+        }
     }
 }

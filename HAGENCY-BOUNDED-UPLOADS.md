@@ -17,7 +17,10 @@ synchronous attachment encryption, HTTP sends and actual serialized request Byte
 belong to an owned operation. Dropping its observing future only marks observer
 cancellation; it cannot drop already-started original SQL or return quota. Bytes
 clones retain the slot and the original Client/credential lease until the last
-actual owner releases it. Worker panic retains unknown charged custody and the
+actual owner releases it. Actual success/error results additionally carry the
+original Client lease across the IO-to-outbox handoff until the durable receipt
+commit returns; retirement cannot turn an already acquired receipt into a weak
+upgrade failure and an unproven resend. Worker panic retains unknown charged custody and the
 Client lease, poisons admission and requires restart; it does not claim IO ended.
 
 Queued Governor closures capture weak client/room references and upgrade only
@@ -30,9 +33,12 @@ strong-client capacity-wait cycle.
 
 Transient capacity preserves the durable request and waits for capacity changes
 or the original Room notifier, then retries that same outbox transaction. Size,
-unsupported-store, paused, stopped and unknown-operation failures retain durable
-rows without a false permanent MissingMediaContent wedge and require explicit
-resume. Existing outbox cancellation and already-started pause semantics remain.
+unsupported-store, paused and stopped failures retain durable rows without a
+false permanent MissingMediaContent wedge and require explicit resume. Unknown
+transport or original-worker outcomes instead persist the existing
+GenericApiError wedge with a stable safe message: restart/set_enabled alone
+cannot resend them. The host uses is_unknown_upload on typed or restored errors
+and asks for explicit confirmation before SendHandle::unwedge. Existing outbox cancellation and already-started pause semantics remain.
 An incoming cache-write can fail before an outbox row exists; the error does not
 claim a pending row was created. Optional duplicate-thumbnail recache remains
 best effort and logs a bounded rejection rather than reading unlimited data.

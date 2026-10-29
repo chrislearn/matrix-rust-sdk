@@ -524,3 +524,112 @@ async fn capacity_waiter_stops_without_holding_original_client_or_durable_store_
     blocker.await.unwrap();
     state(&governor, |s| s.jobs == 0).await;
 }
+
+#[tokio::test]
+async fn unknown_post_is_durable_across_restore_and_only_explicit_unwedge_resends_original_transaction()
+ {
+    let mock = MatrixMockServer::new().await;
+    let directory = tempfile::tempdir().unwrap();
+    let governor = small();
+    let fence = Arc::new(crate::HttpRequestFence::new(|| true));
+    let client = mock
+        .client_builder()
+        .on_builder(|builder| {
+            builder
+                .sqlite_store(directory.path(), None)
+                .upload_governor(governor.clone())
+                .request_fence(fence.clone())
+        })
+        .build()
+        .await;
+    let room = mock.sync_joined_room(&client, room_id!("!unknown:test")).await;
+    mock.mock_authenticated_media_config().ok_default().mount().await;
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_upload()
+        .respond_with(move |_: &wiremock::Request| {
+            fence.retire();
+            ResponseTemplate::new(503).set_body_json(
+                serde_json::json!({"errcode":"M_UNKNOWN","error":"fixture transient"}),
+            )
+        })
+        .mock_once()
+        .mount()
+        .await;
+    let queue = room.send_queue();
+    let (_, mut watch) = queue.subscribe().await.unwrap();
+    let txn = ruma::TransactionId::new();
+    let handle = queue
+        .send_attachment(
+            "source",
+            mime::IMAGE_JPEG,
+            vec![7; 16],
+            AttachmentConfig::new().txn_id(txn.clone()),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let RoomSendQueueUpdate::SendError { error, is_recoverable, .. } =
+                watch.recv().await.unwrap()
+            {
+                assert!(!is_recoverable);
+                assert!(is_unknown_upload(&error));
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let rows = client.state_store().load_send_queue_requests(room.room_id()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(
+        rows[0].error,
+        Some(matrix_sdk_base::store::QueueWedgeError::GenericApiError { .. })
+    ));
+    let old_capability = handle.clone();
+    drop(watch);
+    drop(handle);
+    drop(queue);
+    drop(room);
+    let weak = client.downgrade();
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while weak.get().is_some() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let client = mock
+        .client_builder()
+        .on_builder(|builder| {
+            builder.sqlite_store(directory.path(), None).upload_governor(governor.clone())
+        })
+        .build()
+        .await;
+    let room = client.get_room(room_id!("!unknown:test")).unwrap();
+    let queue = room.send_queue();
+    let (echoes, mut watch) = queue.subscribe().await.unwrap();
+    let crate::send_queue::LocalEchoContent::Event { send_handle, send_error: Some(error), .. } =
+        &echoes[0].content
+    else {
+        panic!("restored original unknown failure must remain visible")
+    };
+    assert_eq!(echoes[0].transaction_id, txn);
+    assert!(send_handle.is_same_request(&send_handle.clone()));
+    assert!(
+        !old_capability.is_same_request(send_handle),
+        "restoration replaces the original request capability even with the same transaction string"
+    );
+    assert!(is_unknown_upload(&crate::Error::SendQueueWedgeError(Box::new(error.clone()))));
+    client.send_queue().set_enabled(true).await;
+    let rows = client.state_store().load_send_queue_requests(room.room_id()).await.unwrap();
+    assert!(rows[0].error.is_some(), "enabling cannot clear the durable unknown gate");
+    mock.mock_upload().ok(mxc_uri!("mxc://test/confirmed-retry")).mock_once().mount().await;
+    mock.mock_room_send().ok(event_id!("$confirmed-retry")).mock_once().mount().await;
+    // Represents the existing explicit owner action; the App adds an accurate
+    // unknown-result confirmation before reaching this original SDK API.
+    send_handle.unwedge().await.unwrap();
+    queue.set_enabled(true);
+    assert_eq!(sent(&mut watch).await, txn);
+}

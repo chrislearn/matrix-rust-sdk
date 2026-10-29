@@ -169,3 +169,204 @@ async fn actual_governed_upload_keeps_client_wide_fence_and_automatic_401_refres
     );
     assert_eq!(attempts.load(Ordering::Acquire), 2);
 }
+
+#[tokio::test]
+async fn closed_encryption_lookup_before_media_post_is_recoverable_pause() {
+    let mock = MatrixMockServer::new().await;
+    let governor = small();
+    let fence = Arc::new(HttpRequestFence::new(|| true));
+    let client = mock
+        .client_builder()
+        .on_builder(|builder| {
+            builder.upload_governor(governor.clone()).request_fence(fence.clone())
+        })
+        .build()
+        .await;
+    let room = mock.sync_joined_room(&client, room_id!("!closed-state:test")).await;
+    client
+        .media_store()
+        .lock()
+        .await
+        .unwrap()
+        .add_media_content(
+            &request(),
+            vec![7; 16],
+            matrix_sdk_base::media::store::IgnoreMediaRetentionPolicy::Yes,
+        )
+        .await
+        .unwrap();
+    fence.retire();
+    let result = governor
+        .submit(0, move |custody, live| async move {
+            upload_original(&room, request(), "image/jpeg".into(), None, 64, custody, live).await
+        })
+        .unwrap()
+        .await;
+    assert!(matches!(result, Err(crate::Error::UploadGovernor(UploadGovernorError::Paused))));
+    assert!(
+        mock.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() != "/_matrix/media/v3/upload")
+    );
+}
+#[tokio::test]
+async fn retirement_between_real_401_and_refresh_keeps_unknown_original_post_receipt() {
+    use crate::{SessionMeta, SessionTokens, authentication::matrix::MatrixSession};
+    let mock = MatrixMockServer::new().await;
+    let governor = small();
+    let fence = Arc::new(HttpRequestFence::new(|| true));
+    let client = mock
+        .client_builder()
+        .unlogged()
+        .on_builder(|builder| {
+            builder
+                .upload_governor(governor.clone())
+                .handle_refresh_tokens()
+                .request_fence(fence.clone())
+        })
+        .build()
+        .await;
+    client
+        .matrix_auth()
+        .restore_session(
+            MatrixSession {
+                meta: SessionMeta {
+                    user_id: ruma::user_id!("@retire:test").to_owned(),
+                    device_id: ruma::device_id!("DEVICE").to_owned(),
+                },
+                tokens: SessionTokens {
+                    access_token: "retiring-access".into(),
+                    refresh_token: Some("retiring-refresh".into()),
+                },
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let room = mock.sync_joined_room(&client, room_id!("!retire-refresh:test")).await;
+    client
+        .media_store()
+        .lock()
+        .await
+        .unwrap()
+        .add_media_content(
+            &request(),
+            vec![7; 16],
+            matrix_sdk_base::media::store::IgnoreMediaRetentionPolicy::Yes,
+        )
+        .await
+        .unwrap();
+    mock.mock_room_state_encryption().expect_access_token("retiring-access").plain().mount().await;
+    mock.mock_authenticated_media_config().ok_default().mount().await;
+    mock.mock_upload().respond_with(move |_:&wiremock::Request|{fence.retire();ResponseTemplate::new(401).set_body_json(serde_json::json!({"errcode":"M_UNKNOWN_TOKEN","error":"fixture access expired","soft_logout":false}))}).mock_once().mount().await;
+    let result = governor
+        .submit(0, move |custody, live| async move {
+            upload_original(&room, request(), "image/jpeg".into(), None, 64, custody, live).await
+        })
+        .unwrap()
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::Error::UploadGovernor(UploadGovernorError::OutcomeUnknown))
+    ));
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(
+        requests.iter().filter(|request| request.url.path() == "/_matrix/media/v3/upload").count(),
+        1
+    );
+    assert!(requests.iter().all(|request| !request.url.path().ends_with("/refresh")));
+}
+#[test]
+fn final_authentication_failures_are_not_silently_reclassified_as_capacity_or_pause() {
+    // Typed API authentication failures are produced and tested by the existing
+    // real SDK HTTP suite; this classifier must not use account liveness as a
+    // shortcut that changes their meaning.
+    let missing = crate::Error::Http(Box::new(crate::HttpError::RefreshToken(
+        crate::error::RefreshTokenError::RefreshTokenRequired,
+    )));
+    assert!(matches!(classify_closed_http(missing, 1), crate::Error::Http(_)));
+}
+
+#[tokio::test]
+async fn actual_final_401_and_refresh_401_remain_authentication_errors() {
+    use wiremock::{
+        Mock,
+        matchers::{method, path},
+    };
+
+    use crate::{SessionMeta, SessionTokens, authentication::matrix::MatrixSession};
+    let mock = MatrixMockServer::new().await;
+    let governor = small();
+    let client = mock
+        .client_builder()
+        .unlogged()
+        .on_builder(|builder| {
+            builder
+                .upload_governor(governor.clone())
+                .handle_refresh_tokens()
+                .request_fence(Arc::new(HttpRequestFence::new(|| true)))
+        })
+        .build()
+        .await;
+    client
+        .matrix_auth()
+        .restore_session(
+            MatrixSession {
+                meta: SessionMeta {
+                    user_id: ruma::user_id!("@auth-failure:test").to_owned(),
+                    device_id: ruma::device_id!("DEVICE").to_owned(),
+                },
+                tokens: SessionTokens {
+                    access_token: "expired-access".into(),
+                    refresh_token: Some("expired-refresh".into()),
+                },
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let room = mock.sync_joined_room(&client, room_id!("!auth-failure:test")).await;
+    client
+        .media_store()
+        .lock()
+        .await
+        .unwrap()
+        .add_media_content(
+            &request(),
+            vec![7; 16],
+            matrix_sdk_base::media::store::IgnoreMediaRetentionPolicy::Yes,
+        )
+        .await
+        .unwrap();
+    mock.mock_room_state_encryption().expect_access_token("expired-access").plain().mount().await;
+    mock.mock_authenticated_media_config().ok_default().mount().await;
+    mock.mock_upload().error_unknown_token(false).mock_once().mount().await;
+    Mock::given(method("POST")).and(path("/_matrix/client/v3/refresh")).respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({"errcode":"M_UNKNOWN_TOKEN","error":"fixture refresh expired","soft_logout":false}))).expect(1).mount(&mock).await;
+    let error = governor
+        .submit(0, move |custody, live| async move {
+            upload_original(&room, request(), "image/jpeg".into(), None, 64, custody, live).await
+        })
+        .unwrap()
+        .await
+        .unwrap_err();
+    assert!(!is_unknown_upload(&error));
+    let crate::Error::Http(error) = error else {
+        panic!("actual authentication error must remain HTTP")
+    };
+    let crate::HttpError::RefreshToken(crate::error::RefreshTokenError::MatrixAuth(error)) = *error
+    else {
+        panic!("actual refresh response retained")
+    };
+    assert_eq!(error.as_client_api_error().unwrap().status_code, 401);
+    assert_eq!(
+        mock.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/_matrix/media/v3/upload")
+            .count(),
+        1
+    );
+}
