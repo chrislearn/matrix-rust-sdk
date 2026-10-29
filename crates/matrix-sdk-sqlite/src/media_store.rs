@@ -61,6 +61,8 @@ mod keys {
     pub const MEDIA: &str = "media";
 }
 
+mod bounded;
+
 /// The database name.
 const DATABASE_NAME: &str = "matrix-sdk-media.sqlite3";
 
@@ -386,6 +388,21 @@ impl MediaStore for SqliteMediaStore {
         let _timer = timer!("method");
 
         self.media_service.get_media_content(self, request).await
+    }
+
+    /// The serialized at-rest envelope and decoded ciphertext each use at most
+    /// `max_bytes + 128` bytes. Borrowed decoding precedes in-place AEAD
+    /// decryption, so Rust content buffers peak at twice that bound. SQLite's
+    /// own connection/page cache is separate from these application buffers.
+    async fn get_media_content_bounded(
+        &self,
+        request: &MediaRequestParameters,
+        max_bytes: usize,
+    ) -> std::result::Result<Option<Vec<u8>>, matrix_sdk_base::media::store::BoundedMediaStoreError>
+    {
+        let content = self.read_content_bounded(request, max_bytes, || {}).await?;
+        self.media_service.bounded_read_finished(self);
+        Ok(content)
     }
 
     #[instrument(skip_all)]

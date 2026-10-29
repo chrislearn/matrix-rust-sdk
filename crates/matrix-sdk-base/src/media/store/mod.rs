@@ -46,6 +46,33 @@ pub use self::{
     memory_store::MemoryMediaStore,
 };
 
+/// An allocation-bounded media read failed.
+///
+/// This error is deliberately separate from [`MediaStoreError`] so existing
+/// store implementations need not change their associated error type.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum BoundedMediaStoreError {
+    /// This backend has not implemented allocation-bounded media reads.
+    #[error("This media store does not support bounded reads")]
+    Unsupported,
+    /// The cached entry exceeds the caller's byte limit.
+    #[error("The cached media exceeds the {max_bytes}-byte read limit")]
+    Exceeded {
+        /// Maximum permitted plaintext media size.
+        max_bytes: usize,
+    },
+    /// The requested limit cannot safely include the storage overhead.
+    #[error("The bounded media read limit {max_bytes} is not representable")]
+    InvalidLimit {
+        /// The unrepresentable limit.
+        max_bytes: usize,
+    },
+    /// An error occurred while reading or decoding the entry.
+    #[error(transparent)]
+    Store(#[from] MediaStoreError),
+}
+
 /// Media store specific error type.
 #[derive(Debug, thiserror::Error)]
 pub enum MediaStoreError {

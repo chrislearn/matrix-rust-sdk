@@ -1,0 +1,51 @@
+name: Hagency bounded media cache
+
+on:
+  pull_request:
+    branches: [codex/mandatory-encrypted-send]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hagency-bounded-media-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bounded-cache:
+    name: Bounded media (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_HOME: ${{ github.workspace }}/cargo-home
+      INSTA_UPDATE: no
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.98.0
+          components: clippy
+      - name: Keep Windows temporary build files on the workspace drive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $temporary = Join-Path $env:GITHUB_WORKSPACE 'tmp'
+          New-Item -ItemType Directory -Force $temporary | Out-Null
+          "TEMP=$temporary" >> $env:GITHUB_ENV
+          "TMP=$temporary" >> $env:GITHUB_ENV
+      - name: Memory and default backend compatibility
+        run: cargo test --locked -p matrix-sdk-base --lib bounded_media_
+      - name: Actual SQLite media store and original compatibility suite
+        run: cargo test --locked -p matrix-sdk-sqlite --features bundled --lib 'media_store::'
+      - name: Original encryption suite and malformed envelopes
+        run: cargo test --locked -p matrix-sdk-store-encryption --lib
+      - name: Strict affected library and test lint
+        run: cargo clippy --locked --no-deps -p matrix-sdk-base -p matrix-sdk-sqlite -p matrix-sdk-store-encryption --features matrix-sdk-sqlite/bundled,matrix-sdk-sqlite/crypto-store --lib --tests -- -D warnings

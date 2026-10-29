@@ -32,8 +32,8 @@ use super::Result;
 use crate::media::{
     MediaRequestParameters, UniqueKey as _,
     store::{
-        IgnoreMediaRetentionPolicy, MediaRetentionPolicy, MediaService, MediaStore,
-        MediaStoreError, MediaStoreInner,
+        BoundedMediaStoreError, IgnoreMediaRetentionPolicy, MediaRetentionPolicy, MediaService,
+        MediaStore, MediaStoreError, MediaStoreInner,
     },
 };
 
@@ -150,6 +150,30 @@ impl MediaStore for MemoryMediaStore {
         request: &MediaRequestParameters,
     ) -> Result<Option<Vec<u8>>, Self::Error> {
         self.media_service.get_media_content(self, request).await
+    }
+
+    async fn get_media_content_bounded(
+        &self,
+        request: &MediaRequestParameters,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, BoundedMediaStoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let expected_key = request.unique_key();
+        let Some(index) = inner.media.iter().position(|media| media.key == expected_key) else {
+            return Ok(None);
+        };
+        // Check the same entry under the same lock before cloning any bytes.
+        let size = inner.media.iter().nth(index).unwrap().data.len();
+        if size > max_bytes {
+            return Err(BoundedMediaStoreError::Exceeded { max_bytes });
+        }
+        let mut content = inner.media.remove(index).unwrap();
+        let data = content.data.clone();
+        content.last_access = SystemTime::now();
+        inner.media.push(content);
+        drop(inner);
+        self.media_service.bounded_read_finished(self);
+        Ok(Some(data))
     }
 
     async fn remove_media_content(
@@ -421,4 +445,48 @@ mod tests {
     media_store_inner_integration_tests!();
     media_store_integration_tests!();
     media_store_integration_tests_time!();
+
+    #[matrix_sdk_test::async_test]
+    async fn test_bounded_media_memory_checks_actual_length_and_preserves_legacy_reads() {
+        use crate::media::{
+            MediaFormat, MediaRequestParameters,
+            store::{
+                BoundedMediaStoreError, IgnoreMediaRetentionPolicy, IntoMediaStore, MediaStore,
+            },
+        };
+        let store = MemoryMediaStore::new();
+        let request = MediaRequestParameters {
+            source: ruma::events::room::MediaSource::Plain(
+                ruma::mxc_uri!("mxc://media.test/memory").to_owned(),
+            ),
+            format: MediaFormat::File,
+        };
+        assert_eq!(store.get_media_content_bounded(&request, 0).await.unwrap(), None);
+        for size in [0, 1, 4096] {
+            store
+                .add_media_content(&request, vec![42; size], IgnoreMediaRetentionPolicy::Yes)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get_media_content_bounded(&request, size).await.unwrap(),
+                Some(vec![42; size])
+            );
+            if size > 0 {
+                assert!(matches!(
+                    store.get_media_content_bounded(&request, size - 1).await,
+                    Err(BoundedMediaStoreError::Exceeded { .. })
+                ));
+            }
+            assert_eq!(store.get_media_content(&request).await.unwrap(), Some(vec![42; size]));
+            assert_eq!(
+                store
+                    .clone()
+                    .into_media_store()
+                    .get_media_content_bounded(&request, size)
+                    .await
+                    .unwrap(),
+                Some(vec![42; size])
+            );
+        }
+    }
 }
