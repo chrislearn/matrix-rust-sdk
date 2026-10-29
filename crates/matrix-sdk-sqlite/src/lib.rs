@@ -43,7 +43,7 @@ use deadpool::managed::PoolConfig;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[cfg(feature = "crypto-store")]
-pub use self::crypto_store::SqliteCryptoStore;
+pub use self::crypto_store::{ExistingAccountIdentity, InspectAccountError, SqliteCryptoStore};
 pub use self::error::OpenStoreError;
 #[cfg(feature = "event-cache-store")]
 pub use self::event_cache_store::SqliteEventCacheStore;
