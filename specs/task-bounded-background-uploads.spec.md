@@ -32,6 +32,7 @@ format while bounding original file-buffer jobs. This is not streaming.
 ## Boundaries
 
 ### Allowed Changes
+- .github/workflows/hagency-bounded-media.yml
 - crates/matrix-sdk/src/lib.rs
 - crates/matrix-sdk/src/client/mod.rs
 - crates/matrix-sdk/src/client/builder/mod.rs
@@ -119,3 +120,8 @@ Scenario: Conditional retry rejects replacement failures under the original queu
 The Governor branch began at 3ccd3851562b1dee920a6d9f3e40bfd77fe3d279 and additionally merges the separately reviewed SDK4 source 95de9a4e393921c446b2b79e5d72ad09411ef586 before final validation. SDK4 source changes are an inherited dependency prerequisite, not this Governor implementation's boundary delta.
 
 R18 remains open: /versions, /media/config and encryption-state preflight metadata responses use the existing general SDK response collector. The upload soak uses trusted bounded metadata responses and cannot qualify an adversarial end-to-end process-memory bound. No global Client response cap or new request_scope is added.
+
+The existing three-OS fatal bounded-media lane also runs the actual Governor,
+original result/SQLite receipt, and conditional retry selectors. All prior
+media, encryption, read-only identity, WeakClient, history, and strict checks
+remain. Local native results do not substitute for pending remote OS checks.
