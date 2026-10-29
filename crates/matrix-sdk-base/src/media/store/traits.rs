@@ -104,8 +104,9 @@ pub trait MediaStore: AsyncTraitDeps {
     /// their content.
     ///
     /// A successful vector's length is the actual media byte count. Backends
-    /// may need additional bounded scratch storage for at-rest encryption; see
-    /// their documentation before reserving a process-wide memory budget.
+    /// may need additional scratch storage for at-rest encryption, native
+    /// content buffers and connection/page caches. The returned-vector bound
+    /// alone is not a process memory budget; see backend documentation.
     /// Cancellation of an async observer may not interrupt backend blocking IO.
     /// A caller's operation and scratch permits must remain owned by the
     /// original worker until this method really completes, even if its

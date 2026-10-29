@@ -233,3 +233,128 @@ async fn bounded_media_sqlite_cancelled_observer_does_not_finish_original_blocki
         Err(BoundedMediaStoreError::Exceeded { .. })
     ));
 }
+
+// SQLite's allocator counters are process-global. Run the real store path in a
+// fresh, exact-test child so unrelated parallel tests cannot contaminate them.
+#[tokio::test]
+async fn bounded_media_sqlite_oversize_preflight_avoids_native_blob_allocation() {
+    const CHILD: &str = "HAGENCY_SQLITE_BOUNDED_NATIVE_PROBE";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "media_store::bounded::tests::bounded_media_sqlite_oversize_preflight_avoids_native_blob_allocation",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "native probe failed: {stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "native probe must execute: {stdout}\n{stderr}");
+        return;
+    }
+
+    const BLOB_BYTES: usize = 128 * 1024 * 1024;
+    const MAX_NATIVE_GROWTH: i64 = 16 * 1024 * 1024;
+    for encrypted in [false, true] {
+        let (_directory, store) = store(encrypted).await;
+        let request = request();
+        store.add_media_content(&request, vec![1], IgnoreMediaRetentionPolicy::Yes).await.unwrap();
+        let uri = store.encode_key(keys::MEDIA, request.source.unique_key());
+        let format = store.encode_key(keys::MEDIA, request.format.unique_key());
+        let conn = store.write().await.unwrap();
+        conn.execute_batch("PRAGMA cache_size=-64; PRAGMA mmap_size=0;").await.unwrap();
+        // zeroblob creates a large existing entry without a Rust content Vec.
+        // For the encrypted store this is deliberately malformed at rest: the
+        // size preflight must reject it before either native copy or decoding.
+        conn.execute(
+            "UPDATE media SET data=zeroblob(?) WHERE uri=? AND format=?",
+            (BLOB_BYTES, uri, format),
+        )
+        .await
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER forbid_access_update BEFORE UPDATE OF last_access ON media \
+             BEGIN SELECT RAISE(ABORT, 'oversize entry reached UPDATE'); END;",
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            store.get_media_content_bounded(&request, 16).await,
+            Err(BoundedMediaStoreError::Exceeded { max_bytes: 16 })
+        ));
+        let conn = store.write().await.unwrap();
+        conn.execute_batch("DROP TRIGGER forbid_access_update;").await.unwrap();
+        drop(conn);
+
+        // The trigger is absent for this measurement: it cannot hide an
+        // allocating UPDATE. These SQLite APIs have no pointers/preconditions
+        // and are safe concurrently, but isolation makes the counter specific.
+        let baseline = unsafe { rusqlite::ffi::sqlite3_memory_used() };
+        unsafe { rusqlite::ffi::sqlite3_memory_highwater(1) };
+        assert!(matches!(
+            store.get_media_content_bounded(&request, 16).await,
+            Err(BoundedMediaStoreError::Exceeded { max_bytes: 16 })
+        ));
+        let peak = unsafe { rusqlite::ffi::sqlite3_memory_highwater(0) };
+        assert!(baseline > 0, "SQLite allocator instrumentation must be active");
+        let growth = peak.saturating_sub(baseline);
+        eprintln!("encrypted={encrypted} existing_bytes={BLOB_BYTES} native_growth={growth}");
+        assert!(
+            growth < MAX_NATIVE_GROWTH,
+            "rejecting a 128MiB entry must not allocate its native blob: {growth} bytes"
+        );
+        // SQLite's BLOB affinity also permits a corrupted TEXT entry.
+        // Its NUL character length is zero despite 128MiB of encoded bytes.
+        let conn = store.write().await.unwrap();
+        conn.execute_batch(
+            "UPDATE media SET data=CAST(data AS TEXT); \
+             CREATE TRIGGER forbid_access_update BEFORE UPDATE OF last_access ON media \
+             BEGIN SELECT RAISE(ABORT, 'non-blob entry reached UPDATE'); END;",
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            store.get_media_content_bounded(&request, 16).await,
+            Err(BoundedMediaStoreError::Store(MediaStoreError::InvalidData { .. }))
+        ));
+        let conn = store.write().await.unwrap();
+        conn.execute_batch("DROP TRIGGER forbid_access_update;").await.unwrap();
+        drop(conn);
+        let baseline = unsafe { rusqlite::ffi::sqlite3_memory_used() };
+        unsafe { rusqlite::ffi::sqlite3_memory_highwater(1) };
+        assert!(matches!(
+            store.get_media_content_bounded(&request, 16).await,
+            Err(BoundedMediaStoreError::Store(MediaStoreError::InvalidData { .. }))
+        ));
+        let peak = unsafe { rusqlite::ffi::sqlite3_memory_highwater(0) };
+        let growth = peak.saturating_sub(baseline);
+        eprintln!("encrypted={encrypted} invalid_text_bytes={BLOB_BYTES} native_growth={growth}");
+        assert!(growth < MAX_NATIVE_GROWTH, "invalid TEXT must not materialize: {growth} bytes");
+
+        // Also record the accepted 64MiB path, including the native UPDATE
+        // buffers. This is an observation, not a two-times process/RSS cap.
+        const ACCEPTED_BYTES: usize = 64 * 1024 * 1024;
+        store
+            .add_media_content(&request, vec![1; ACCEPTED_BYTES], IgnoreMediaRetentionPolicy::Yes)
+            .await
+            .unwrap();
+        let baseline = unsafe { rusqlite::ffi::sqlite3_memory_used() };
+        unsafe { rusqlite::ffi::sqlite3_memory_highwater(1) };
+        let accepted =
+            store.get_media_content_bounded(&request, ACCEPTED_BYTES).await.unwrap().unwrap();
+        let peak = unsafe { rusqlite::ffi::sqlite3_memory_highwater(0) };
+        assert_eq!(accepted.len(), ACCEPTED_BYTES);
+        assert!(accepted.iter().all(|byte| *byte == 1));
+        eprintln!(
+            "encrypted={encrypted} accepted_bytes={ACCEPTED_BYTES} native_growth={}",
+            peak.saturating_sub(baseline)
+        );
+        store.close().await.unwrap();
+    }
+}

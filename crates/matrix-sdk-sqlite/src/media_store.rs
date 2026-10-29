@@ -392,8 +392,11 @@ impl MediaStore for SqliteMediaStore {
 
     /// The serialized at-rest envelope and decoded ciphertext each use at most
     /// `max_bytes + 128` bytes. Borrowed decoding precedes in-place AEAD
-    /// decryption, so Rust content buffers peak at twice that bound. SQLite's
-    /// own connection/page cache is separate from these application buffers.
+    /// decryption, so Rust content buffers peak at twice that bound. Type and
+    /// length are checked before UPDATE as well as copying. SQLite additionally
+    /// uses native temporary buffers to update accepted rows, and its own
+    /// connection/page cache; neither is included in that Rust buffer bound.
+    /// This is not a combined native heap or process RSS guarantee.
     async fn get_media_content_bounded(
         &self,
         request: &MediaRequestParameters,

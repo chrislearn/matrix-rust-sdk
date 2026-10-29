@@ -47,16 +47,16 @@ impl SqliteMediaStore {
             self.write().await.map_err(|error| BoundedMediaStoreError::Store(error.into()))?;
         let bytes = conn
             .with_transaction::<_, ReadError, _>(move |txn| {
-                // Enter write mode before any SELECT, exactly as the legacy read.
-                // A second connection/process cannot replace the entry between
-                // this size check and the SELECT that copies the actual bytes.
-                txn.execute(
-                    "UPDATE media SET last_access = ? WHERE uri = ? AND format = ?",
-                    (timestamp, &uri, &format),
-                )?;
+                // Preflight before UPDATE as well as before copying data:
+                // SQLite can rebuild the entire row while updating last_access,
+                // allocating native buffers proportional to the original blob.
+                // BLOB affinity is not a strict type constraint. Reject TEXT
+                // without evaluating its length (NUL/character semantics) or
+                // casting/materializing it. CASE evaluates only its chosen arm.
                 let size: Option<i64> = txn
                     .query_row(
-                        "SELECT length(data) FROM media WHERE uri = ? AND format = ?",
+                        "SELECT CASE WHEN typeof(data) = 'blob' THEN length(data) ELSE -1 END \
+                         FROM media WHERE uri = ? AND format = ?",
                         (&uri, &format),
                         |row| row.get(0),
                     )
@@ -67,7 +67,7 @@ impl SqliteMediaStore {
                 let size = usize::try_from(size).map_err(|_| {
                     ReadError::Bound(
                         MediaStoreError::InvalidData {
-                            details: "Cached media has an invalid encoded size".into(),
+                            details: "Cached media has an invalid encoded type or size".into(),
                         }
                         .into(),
                     )
@@ -75,6 +75,13 @@ impl SqliteMediaStore {
                 if size > max_encoded {
                     return Err(ReadError::Bound(BoundedMediaStoreError::Exceeded { max_bytes }));
                 }
+                // This same transaction retains the preflight snapshot. Once
+                // the write upgrade succeeds, no other connection can replace
+                // it before the copy; a conflicting upgrade returns an error.
+                txn.execute(
+                    "UPDATE media SET last_access = ? WHERE uri = ? AND format = ?",
+                    (timestamp, &uri, &format),
+                )?;
                 after_size_check();
                 let bytes: Vec<u8> = txn.query_row(
                     "SELECT data FROM media WHERE uri = ? AND format = ?",

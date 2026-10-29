@@ -12,9 +12,12 @@ explicitly unsupported until they implement a bounded read. The erased store
 facade forwards the method. Existing `get_media_content` behavior is unchanged.
 
 Memory checks the original entry's length before cloning under one write lock.
-SQLite checks `length(data)` before copying data, and retains the same write
-transaction through the copy, excluding replacement by another connection or
-process. Plain reads copy at most `max_bytes`. Encrypted at-rest entries use the
+SQLite preflights the actual BLOB length before both the timestamp UPDATE
+and content copy. Non-BLOB entries are rejected with a lazy type-checked SQL
+expression, without interpreting TEXT character/NUL length or materializing a
+cast. The same transaction retains its snapshot; once its write upgrade
+succeeds, another connection/process cannot replace the checked entry before
+the copy. A conflicting write upgrade returns a backend error. Plain reads copy at most `max_bytes`. Encrypted at-rest entries use the
 existing canonical MessagePack `EncryptedValue`, not JSON/base64: ciphertext is
 binary and the nonce is fixed at 24 bytes. The encoded blob is limited to
 `max_bytes + 128` with checked arithmetic before reading. A borrowed-bytes
@@ -26,9 +29,12 @@ the vector's `len()`.
 
 Encrypted Rust content buffers peak at at most `2 * (max_bytes + 128)`, including
 the borrowed input envelope plus the owned ciphertext/plaintext allocation.
-SQLite's configured connection/page caches and allocator bookkeeping are
-separate. Callers must reserve scratch as well as returned bytes when enforcing
-global memory and concurrency budgets. This API does not promise a process RSS
+This is a Rust content-buffer bound, not a combined SQLite/native heap bound.
+SQLite may additionally rebuild an accepted row during its timestamp UPDATE,
+using temporary native content buffers; its configured connection/page caches
+and allocator bookkeeping are separate too. Their allocation depends on the
+accepted entry size and SQLite build. Callers must distinguish Rust scratch
+from native SQLite memory when enforcing global memory and concurrency budgets. This API does not promise a process RSS
 limit, bound existing stored entries, or stream uploads/downloads over HTTP.
 
 Dropping an async observer cannot stop a SQLite closure already running under
@@ -120,3 +126,23 @@ suppression was changed; the original failed Clippy log remains retained.
 The bounded-profile test lint also exposed redundant `&store` borrows after
 `as_clean()` already returned a store reference. Only those test-call borrows
 were removed; every fixture, production path and behavioral assertion remains.
+
+Native-allocation verification found and fixed an important preflight ordering
+problem: the old timestamp UPDATE ran before the length check. In a fresh
+macOS arm64 process linked to the actual bundled SQLite 3.53.2, an existing 128MiB BLOB
+caused an additional 268,763,136 bytes of peak process RSS during that UPDATE,
+even with a 64KiB page cache and mmap disabled. The type/length preflight now
+runs first. An isolated actual SDK regression uses the real SQLite allocator
+high-water counter, reset after fixture construction; 128MiB oversized BLOBs
+and invalid NUL-containing TEXT entries showed zero additional native bytes
+in both plain and encrypted-store modes. A rejecting UPDATE trigger separately
+proves those failures precede row mutation, and is removed before measuring
+native allocation so it cannot mask the old allocating path.
+
+The same real SDK probe successfully returned/authenticated accepted 64MiB
+content in both modes. With those local SQLite/cache settings its additional
+peak native allocation was 268,599,296 bytes in each mode, beyond Rust content
+buffers. This is an observed local result, not a portable multiplier, total
+heap budget or RSS guarantee. All 32 actual SQLite media tests, including
+independent-connection replacement and observer cancellation, passed after
+this correction; the strict affected-library/test Clippy checks also passed.
