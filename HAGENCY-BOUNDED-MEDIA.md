@@ -75,7 +75,18 @@ runner v5.2.1 `CODSPEED_SKIP_UPLOAD` flag. Its exact source tag resolves to
 `8868af5a1e582ade8cbe080ae6f79da12650d131`: `src/cli/shared.rs`
 declares the flag, and `src/executor/orchestrator.rs` checks it only after every
 executor has run, immediately before uploading. All six suites still compile
-and measure with `allow-empty: false`. Each job must upload the actual profile
+and measure with `allow-empty: false`. The pinned simulation executor does not
+actually enforce that flag locally (its old validation happens on upload), so
+fork CI additionally runs `tools/check_benchmark_profiles.py` before accepting
+results. Each suite must contain matching named Callgrind parts, the pinned Rust
+integration metadata, an Ir event, actual nonzero instruction cost rows and
+nonzero final totals in the same completed part. Metadata, termination wrappers,
+logs, empty or truncated parts cannot pass. Actual combined profiles have zero
+`summary` headers; the checker deliberately uses their completed `totals`.
+Six Python regression groups cover those failure modes, and the checker was
+also run on four real hosted artifacts (crypto 6, linked-chunk 21, store 3,
+timeline 1 measured parts).
+Each job must upload the actual profile
 files/logs as a seven-day GitHub artifact; missing output fails the job. The
 official `create_profile_folder` writes `profile.*.out` under `TMPDIR`, which is
 set to a dedicated runner temporary folder. The upstream `matrix-org` workflow
