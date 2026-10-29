@@ -40,6 +40,7 @@ mod matrix_auth;
 mod media;
 mod notification;
 mod refresh_token;
+mod request_fence;
 mod room;
 mod room_preview;
 mod send_queue;

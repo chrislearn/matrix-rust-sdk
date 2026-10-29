@@ -44,6 +44,8 @@ mod error;
 pub mod event_cache;
 pub mod event_handler;
 mod http_client;
+mod request_fence;
+pub use request_fence::{HttpRequestFence, HttpRequestPermit};
 pub mod latest_events;
 pub mod media;
 pub mod notification_settings;
@@ -74,7 +76,7 @@ pub use client::homeserver_capabilities::HomeserverCapabilities;
 pub mod search_index;
 pub use client::{
     Client, ClientBuildError, ClientBuilder, LoopCtrl, ServerVendorInfo, SessionChange, StoreSizes,
-    TileServerInfo, sanitize_server_name,
+    TileServerInfo, WeakClient, sanitize_server_name,
 };
 pub use error::{
     BeaconError, Error, HttpError, HttpResult, NotificationSettingsError, RefreshTokenError,

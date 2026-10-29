@@ -14,7 +14,7 @@
 
 #![deny(unreachable_pub)]
 
-use std::{fmt::Debug, future::IntoFuture};
+use std::{fmt::Debug, future::IntoFuture, sync::Arc};
 
 use eyeball::{SharedObservable, Subscriber};
 use js_int::UInt;
@@ -44,6 +44,7 @@ pub struct SendRequest<R> {
     pub(crate) client: Client,
     pub(crate) request: R,
     pub(crate) config: Option<RequestConfig>,
+    pub(crate) request_fence: Option<Arc<crate::HttpRequestFence>>,
     pub(crate) send_progress: SharedObservable<TransmissionProgress>,
 }
 
@@ -66,6 +67,16 @@ impl<R> SendRequest<R> {
     /// one provided by default.
     pub fn with_request_config(mut self, request_config: impl Into<Option<RequestConfig>>) -> Self {
         self.config = request_config.into();
+        self
+    }
+
+    /// Fence this request in addition to the Client's global fence. Admission
+    /// is checked after the real concurrency wait and before each HTTP retry.
+    /// Scoped requests never trigger automatic credential refresh; the caller
+    /// must explicitly reauthorize a failed request. The original body remains
+    /// joined by its fence permit. This replaces any prior per-request fence.
+    pub fn with_request_fence(mut self, fence: Arc<crate::HttpRequestFence>) -> Self {
+        self.request_fence = Some(fence);
         self
     }
 
@@ -162,16 +173,28 @@ where
             }
         }
 
-        let Self { client, request, config, send_progress } = self;
+        let Self { client, request, config, send_progress, request_fence } = self;
 
         Box::pin(async move {
-            let res =
-                Box::pin(client.send_inner(request.clone(), config, send_progress.clone())).await;
+            let res = Box::pin(client.send_inner(
+                request.clone(),
+                config,
+                send_progress.clone(),
+                request_fence.clone(),
+            ))
+            .await;
 
-            if let Err(e) = &res
+            if request_fence.is_none()
+                && let Err(e) = &res
                 && let RetryRequest::Yes = handle_unknown_token_error(e, &client).await?
             {
-                return Box::pin(client.send_inner(request, config, send_progress)).await;
+                return Box::pin(client.send_inner(
+                    request,
+                    config,
+                    send_progress,
+                    request_fence.clone(),
+                ))
+                .await;
             }
 
             res
@@ -188,6 +211,11 @@ pub struct SendMediaUploadRequest {
 }
 
 impl SendMediaUploadRequest {
+    /// Fence this upload at the actual HTTP admission, including queue waits.
+    pub fn with_request_fence(mut self, fence: Arc<crate::HttpRequestFence>) -> Self {
+        self.send_request = self.send_request.with_request_fence(fence);
+        self
+    }
     pub fn new(request: SendRequest<media::create_content::v3::Request>) -> Self {
         Self { send_request: request }
     }

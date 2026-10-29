@@ -571,6 +571,18 @@ impl Client {
         ClientBuilder::new()
     }
 
+    /// Return an opaque weak reference to this client's original shared state.
+    ///
+    /// Keeping it in an idle callback does not retain the client, its stores or
+    /// background work. [`WeakClient::get`] temporarily acquires a strong
+    /// reference if any strong owner still exists. Active operations must
+    /// retain their own strong client until their original IO really
+    /// finishes; a weak reference is neither a cancellation barrier nor an
+    /// authorization check.
+    pub fn downgrade(&self) -> WeakClient {
+        WeakClient::from_client(self)
+    }
+
     pub(crate) fn base_client(&self) -> &BaseClient {
         &self.inner.base_client
     }
@@ -663,7 +675,12 @@ impl Client {
         use ruma::api::federation::discovery::get_server_version;
 
         let res = self
-            .send_inner(get_server_version::v1::Request::new(), request_config, Default::default())
+            .send_inner(
+                get_server_version::v1::Request::new(),
+                request_config,
+                Default::default(),
+                None,
+            )
             .await?;
 
         // Extract server info, using defaults if fields are missing.
@@ -2103,6 +2120,7 @@ impl Client {
             client: self.clone(),
             request,
             config: None,
+            request_fence: None,
             send_progress: Default::default(),
         }
     }
@@ -2112,6 +2130,7 @@ impl Client {
         request: Request,
         config: Option<RequestConfig>,
         send_progress: SharedObservable<TransmissionProgress>,
+        request_fence: Option<Arc<crate::HttpRequestFence>>,
     ) -> HttpResult<Request::IncomingResponse>
     where
         Request: OutgoingRequest + Debug,
@@ -2127,9 +2146,9 @@ impl Client {
         let path_builder_input =
             Request::PathBuilder::get_path_builder_input(self, skip_auth).await?;
 
-        let result = self
-            .inner
-            .http_client
+        let mut http = self.inner.http_client.clone();
+        http.request_scope = request_fence;
+        let result = http
             .send(
                 request,
                 config,
@@ -3972,10 +3991,16 @@ impl Client {
     }
 }
 
-/// A weak reference to the inner client, useful when trying to get a handle
-/// on the owning client.
+/// An opaque weak reference to a [`Client`]'s original shared state.
+///
+/// Created by [`Client::downgrade`] or [`Self::from_client`], this does not
+/// keep client resources alive. [`Self::get`] upgrades the same inner state
+/// while a strong owner (including active background work) remains. Once the
+/// last strong reference is gone it returns `None`; cloning a weak reference
+/// cannot revive it. Callers must separately check their account/session
+/// authority.
 #[derive(Clone, Debug)]
-pub(crate) struct WeakClient {
+pub struct WeakClient {
     client: Weak<ClientInner>,
 }
 
@@ -3985,20 +4010,34 @@ impl WeakClient {
         Self { client: Arc::downgrade(client) }
     }
 
-    /// Construct a [`WeakClient`] from a [`Client`].
+    /// Construct a weak reference to the client's original shared state,
+    /// without adding a strong owner. Equivalent to [`Client::downgrade`].
     pub fn from_client(client: &Client) -> Self {
         Self::from_inner(&client.inner)
     }
 
-    /// Attempts to get a [`Client`] from this [`WeakClient`].
+    /// Temporarily acquire a strong handle to the original client, or `None`
+    /// after its last strong owner has gone. Success alone does not authorize
+    /// work for an account or session that has since retired.
     pub fn get(&self) -> Option<Client> {
         self.client.upgrade().map(|inner| Client { inner })
+    }
+
+    /// Return whether both weak handles refer to the same original client state.
+    ///
+    /// This compares allocation identity without upgrading either handle,
+    /// reading session metadata or accessing a store. It also works before a
+    /// client has a session and after its last strong owner has gone. Distinct
+    /// clients remain distinct even when configured with the same homeserver
+    /// and stores. Equality does not establish liveness or account authority.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.client, &other.client)
     }
 
     /// Gets the number of strong (`Arc`) pointers still pointing to this
     /// client.
     #[allow(dead_code)]
-    pub fn strong_count(&self) -> usize {
+    pub(crate) fn strong_count(&self) -> usize {
         self.client.strong_count()
     }
 }
@@ -4514,6 +4553,85 @@ pub(crate) mod tests {
     }
 
     #[async_test]
+    async fn test_public_weak_client_preserves_identity_and_last_strong_lifetime() {
+        // No login, discovery or network request: explicit homeserver and
+        // versions create a real, unlogged SDK Client with in-memory stores.
+        let client = Client::builder()
+            .homeserver_url("https://weak-client.example.invalid")
+            .server_versions([MatrixVersion::V1_0])
+            .build()
+            .await
+            .unwrap();
+        let weak: WeakClient = client.downgrade();
+        let weak_clone = weak.clone();
+        let from_public_constructor = WeakClient::from_client(&client);
+        assert_eq!(Arc::strong_count(&client.inner), 1, "weak handles must not add a strong owner");
+        let upgraded = weak.get().unwrap();
+        assert!(
+            Arc::ptr_eq(&client.inner, &upgraded.inner),
+            "upgrade must retain actual SDK Client identity, not a new Arc<Client> wrapper"
+        );
+        assert_eq!(client.homeserver(), upgraded.homeserver());
+        let clone = client.clone();
+        drop(client);
+        drop(upgraded);
+        let upgraded = weak_clone.get().expect("the original client clone remains alive");
+        assert!(Arc::ptr_eq(&clone.inner, &upgraded.inner));
+        drop(upgraded);
+        assert_eq!(Arc::strong_count(&clone.inner), 1);
+        drop(clone);
+        assert!(weak.get().is_none());
+        assert!(weak_clone.get().is_none());
+        assert!(from_public_constructor.get().is_none());
+    }
+
+    #[async_test]
+    async fn test_public_weak_client_ptr_eq_without_session_or_strong_retention() {
+        // Use real, unlogged clients with the same actual MemoryStore. Client
+        // identity must not be inferred from either session metadata or stores.
+        let shared_store = Arc::new(MemoryStore::new());
+        let build = || {
+            Client::builder()
+                .homeserver_url("https://weak-client.example.invalid")
+                .server_versions([MatrixVersion::V1_0])
+                .store_config(
+                    StoreConfig::new(CrossProcessLockConfig::SingleProcess)
+                        .state_store(shared_store.clone()),
+                )
+                .build()
+        };
+        let client = build().await.unwrap();
+        let other_client = build().await.unwrap();
+        assert!(client.session_meta().is_none());
+        assert!(other_client.session_meta().is_none());
+        let weak = client.downgrade();
+        let weak_clone = weak.clone();
+        let from_client_clone = WeakClient::from_client(&client.clone());
+        let other = other_client.downgrade();
+        assert!(weak.ptr_eq(&weak));
+        assert!(weak.ptr_eq(&weak_clone));
+        assert!(weak_clone.ptr_eq(&from_client_clone));
+        assert!(from_client_clone.ptr_eq(&weak));
+        assert!(!weak.ptr_eq(&other));
+        assert!(!other.ptr_eq(&weak));
+        assert_eq!(Arc::strong_count(&client.inner), 1);
+        assert_eq!(Arc::strong_count(&other_client.inner), 1);
+        drop(client);
+        drop(other_client);
+        assert!(weak.get().is_none());
+        assert!(weak_clone.get().is_none());
+        assert!(from_client_clone.get().is_none());
+        assert!(other.get().is_none());
+        // Weak allocation identity remains meaningful after both ClientInner
+        // values are gone; comparison neither revives nor retains either one.
+        assert!(weak.ptr_eq(&from_client_clone));
+        assert!(!weak.ptr_eq(&other));
+        assert!(!other.ptr_eq(&weak_clone));
+        assert_eq!(weak.strong_count(), 0);
+        assert_eq!(other.strong_count(), 0);
+    }
+
+    #[async_test]
     async fn test_client_no_cycle_with_event_cache() {
         let (client, _server) = crate::test_utils::client::isolated_local_client().await;
 
@@ -4528,21 +4646,12 @@ pub(crate) mod tests {
             let response = SyncResponseBuilder::default()
                 .add_joined_room(JoinedRoomBuilder::new(room_id))
                 .build_sync_response();
-            client
-                .inner
-                .base_client
-                .receive_sync_response(response)
-                .await
-                .unwrap();
+            client.inner.base_client.receive_sync_response(response).await.unwrap();
 
             client.event_cache().subscribe().unwrap();
 
-            let (_room_event_cache, _drop_handles) = client
-                .get_room(room_id)
-                .unwrap()
-                .event_cache()
-                .await
-                .unwrap();
+            let (_room_event_cache, _drop_handles) =
+                client.get_room(room_id).unwrap().event_cache().await.unwrap();
         }
 
         drop(client);
@@ -4659,9 +4768,7 @@ pub(crate) mod tests {
         let server_url = server.uri();
         let domain = server_url.strip_prefix("http://").unwrap();
         let server_name = <&ServerName>::try_from(domain).unwrap();
-        let rtc_foci = vec![RtcTransport::livekit(
-            "https://livekit.example.com".to_owned(),
-        )];
+        let rtc_foci = vec![RtcTransport::livekit("https://livekit.example.com".to_owned())];
 
         let well_known_mock = server
             .mock_well_known()
@@ -4720,13 +4827,7 @@ pub(crate) mod tests {
         // Now, reset the cache, and observe the endpoints being called again once.
         client.reset_well_known().await.unwrap();
 
-        server
-            .mock_well_known()
-            .ok()
-            .named("second well known mock")
-            .expect(2)
-            .mount()
-            .await;
+        server.mock_well_known().ok().named("second well known mock").expect(2).mount().await;
 
         // Hits network again.
         assert_eq!(client.well_known_rtc_transports().await.unwrap(), rtc_foci);
@@ -5509,6 +5610,7 @@ pub(crate) mod tests {
             client: client.clone(),
             request: upload_request,
             config: None,
+            request_fence: None,
             send_progress: SharedObservable::new(TransmissionProgress::default()),
         };
         let media_request = SendMediaUploadRequest::new(request);

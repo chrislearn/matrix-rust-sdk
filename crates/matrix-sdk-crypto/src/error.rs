@@ -82,6 +82,10 @@ pub enum OlmError {
     #[error("encryption failed due to an error collecting the recipient devices: {0}")]
     SessionRecipientCollectionError(SessionRecipientCollectionError),
 
+    /// A bounded set of cross-signed remote devices for our own account is unavailable.
+    #[error("a bounded set of cross-signed own devices is unavailable")]
+    OwnDeviceRecipientsUnavailable,
+
     /// Encrypted content is withheld from this device
     #[error("encryption content is withheld from this: {0}")]
     Withheld(WithheldCode),

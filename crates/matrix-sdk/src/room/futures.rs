@@ -65,13 +65,21 @@ pub struct SendMessageLikeEvent<'a> {
     content: serde_json::Result<serde_json::Value>,
     transaction_id: Option<OwnedTransactionId>,
     request_config: Option<RequestConfig>,
+    require_encryption: bool,
 }
 
 impl<'a> SendMessageLikeEvent<'a> {
     pub(crate) fn new(room: &'a Room, content: impl MessageLikeEventContent) -> Self {
         let event_type = content.event_type().to_string();
         let content = serde_json::to_value(&content);
-        Self { room, event_type, content, transaction_id: None, request_config: None }
+        Self {
+            room,
+            event_type,
+            content,
+            transaction_id: None,
+            request_config: None,
+            require_encryption: false,
+        }
     }
 
     /// Set a transaction ID for this event.
@@ -96,6 +104,17 @@ impl<'a> SendMessageLikeEvent<'a> {
         self
     }
 
+    /// Require this event to be encrypted before it is sent.
+    ///
+    /// Returns [`crate::Error::EncryptionRequired`] without sending the event if
+    /// encryption support is disabled or the room is not encrypted. Unlike the
+    /// default behaviour, reactions are encrypted too. This does not establish
+    /// the identity or trust of recipients; callers must check those separately.
+    pub fn require_encryption(mut self) -> Self {
+        self.require_encryption = true;
+        self
+    }
+
     /// Assign a given [`RequestConfig`] to configure how this request should
     /// behave with respect to the network.
     pub fn with_request_config(mut self, request_config: RequestConfig) -> Self {
@@ -109,10 +128,11 @@ impl<'a> IntoFuture for SendMessageLikeEvent<'a> {
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { room, event_type, content, transaction_id, request_config } = self;
+        let Self { room, event_type, content, transaction_id, request_config, require_encryption } =
+            self;
         Box::pin(async move {
             let content = content?;
-            assign!(room.send_raw(&event_type, content), { transaction_id, request_config }).await
+            assign!(room.send_raw(&event_type, content), { transaction_id, request_config, require_encryption }).await
         })
     }
 }
@@ -126,6 +146,7 @@ pub struct SendRawMessageLikeEvent<'a> {
     tracing_span: Span,
     transaction_id: Option<OwnedTransactionId>,
     request_config: Option<RequestConfig>,
+    require_encryption: bool,
 }
 
 impl<'a> SendRawMessageLikeEvent<'a> {
@@ -142,6 +163,7 @@ impl<'a> SendRawMessageLikeEvent<'a> {
             tracing_span: Span::current(),
             transaction_id: None,
             request_config: None,
+            require_encryption: false,
         }
     }
 
@@ -161,6 +183,17 @@ impl<'a> SendRawMessageLikeEvent<'a> {
     ///   events sent by our own device and/or to implement local echo.
     pub fn with_transaction_id(mut self, txn_id: &TransactionId) -> Self {
         self.transaction_id = Some(txn_id.to_owned());
+        self
+    }
+
+    /// Require this event to be encrypted before it is sent.
+    ///
+    /// Returns [`crate::Error::EncryptionRequired`] without sending the event if
+    /// encryption support is disabled or the room is not encrypted. Unlike the
+    /// default behaviour, reactions are encrypted too. This does not establish
+    /// the identity or trust of recipients; callers must check those separately.
+    pub fn require_encryption(mut self) -> Self {
+        self.require_encryption = true;
         self
     }
 
@@ -185,10 +218,16 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
             tracing_span,
             transaction_id,
             request_config,
+            require_encryption,
         } = self;
 
         let fut = async move {
             room.ensure_room_joined()?;
+
+            #[cfg(not(feature = "e2e-encryption"))]
+            if require_encryption {
+                return Err(crate::Error::EncryptionRequired);
+            }
 
             let txn_id = transaction_id.unwrap_or_else(TransactionId::new);
             Span::current().record("transaction_id", tracing::field::debug(&txn_id));
@@ -204,9 +243,9 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
             #[cfg(feature = "e2e-encryption")]
             if room.latest_encryption_state().await?.is_encrypted() {
                 Span::current().record("is_room_encrypted", true);
-                // Reactions are currently famously not encrypted, skip encrypting
-                // them until they are.
-                if event_type == "m.reaction" {
+                // Preserve the default plaintext reaction behaviour unless the
+                // caller explicitly requires encryption.
+                if event_type == "m.reaction" && !require_encryption {
                     trace!("Sending plaintext event because of the event type.");
                 } else {
                     trace!(
@@ -226,6 +265,9 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                     event_type = "m.room.encrypted";
                 }
             } else {
+                if require_encryption {
+                    return Err(crate::Error::EncryptionRequired);
+                }
                 Span::current().record("is_room_encrypted", false);
                 trace!("Sending plaintext event because the room is NOT encrypted.");
             }

@@ -10,7 +10,8 @@ on:
 jobs:
   benchmarks:
     name: Run Benchmarks
-    runs-on: ubuntu-latest
+    # The pinned CodSpeed simulation runner reports Unsupported system on 26.04.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
@@ -96,8 +97,33 @@ jobs:
       - name: Build the benchmark target(s)
         run: cargo codspeed build -p benchmarks --bench ${{ matrix.benchmark }} --features codspeed
 
+      - name: Prepare local benchmark output
+        run: mkdir -p "${{ runner.temp }}/codspeed-profiles"
+
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea
+        env:
+          # This maintained fork has no CodSpeed project. The pinned CLI still
+          # runs and validates every measurement; only its cloud upload is off.
+          # The upstream matrix-org repository retains its original upload.
+          CODSPEED_SKIP_UPLOAD: ${{ github.repository == 'chrislearn/matrix-rust-sdk' }}
+          TMPDIR: ${{ runner.temp }}/codspeed-profiles
         with:
           run: cargo codspeed run
           mode: simulation
+          allow-empty: false
+
+      - name: Preserve fork benchmark measurements
+        if: github.repository == 'chrislearn/matrix-rust-sdk'
+        run: |
+          /usr/bin/python3 -B tools/test_check_benchmark_profiles.py
+          /usr/bin/python3 -B tools/check_benchmark_profiles.py "${{ runner.temp }}/codspeed-profiles" "${{ matrix.benchmark }}"
+
+      - name: Upload validated fork measurements
+        if: github.repository == 'chrislearn/matrix-rust-sdk'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codspeed-${{ matrix.benchmark }}
+          path: ${{ runner.temp }}/codspeed-profiles/profile.*.out/
+          if-no-files-found: error
+          retention-days: 7

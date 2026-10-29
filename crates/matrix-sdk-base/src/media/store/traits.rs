@@ -24,7 +24,9 @@ use ruma::{MxcUri, time::SystemTime};
 use crate::media::store::MediaService;
 use crate::media::{
     MediaRequestParameters,
-    store::{IgnoreMediaRetentionPolicy, MediaRetentionPolicy, MediaStoreError},
+    store::{
+        BoundedMediaStoreError, IgnoreMediaRetentionPolicy, MediaRetentionPolicy, MediaStoreError,
+    },
 };
 
 /// An abstract trait that can be used to implement different store backends
@@ -91,6 +93,31 @@ pub trait MediaStore: AsyncTraitDeps {
         &self,
         request: &MediaRequestParameters,
     ) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// Read cached media only if its actual plaintext length is at most
+    /// `max_bytes`, checking before copying or decrypting the entire content.
+    ///
+    /// `None` means the entry is absent. Oversized entries and backends without
+    /// a bounded implementation return explicit errors; neither is a cache
+    /// miss. The default never calls the unbounded read, preserving
+    /// compatibility for third-party stores without silently allocating
+    /// their content.
+    ///
+    /// A successful vector's length is the actual media byte count. Backends
+    /// may need additional scratch storage for at-rest encryption, native
+    /// content buffers and connection/page caches. The returned-vector bound
+    /// alone is not a process memory budget; see backend documentation.
+    /// Cancellation of an async observer may not interrupt backend blocking IO.
+    /// A caller's operation and scratch permits must remain owned by the
+    /// original worker until this method really completes, even if its
+    /// observer retires.
+    async fn get_media_content_bounded(
+        &self,
+        _request: &MediaRequestParameters,
+        _max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, BoundedMediaStoreError> {
+        Err(BoundedMediaStoreError::Unsupported)
+    }
 
     /// Remove a media file's content from the media store.
     ///
@@ -331,6 +358,14 @@ impl<T: MediaStore> MediaStore for EraseMediaStoreError<T> {
         self.0.get_media_content(request).await.map_err(Into::into)
     }
 
+    async fn get_media_content_bounded(
+        &self,
+        request: &MediaRequestParameters,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, BoundedMediaStoreError> {
+        self.0.get_media_content_bounded(request, max_bytes).await
+    }
+
     async fn remove_media_content(
         &self,
         request: &MediaRequestParameters,
@@ -424,3 +459,6 @@ where
         unsafe { Arc::from_raw(ptr_erased) }
     }
 }
+
+#[cfg(test)]
+mod bounded_tests;

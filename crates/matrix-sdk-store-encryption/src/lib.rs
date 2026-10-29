@@ -25,7 +25,7 @@ use base64::{
 use blake3::{Hash, derive_key};
 use chacha20poly1305::{
     Key as ChachaKey, KeyInit, XChaCha20Poly1305, XNonce,
-    aead::{Aead, Error as EncryptionError},
+    aead::{Aead, AeadInOut, Error as EncryptionError},
 };
 use hkdf::Hkdf;
 use hmac::Hmac;
@@ -39,6 +39,11 @@ const VERSION: u8 = 1;
 const KDF_SALT_SIZE: usize = 32;
 const XNONCE_SIZE: usize = 24;
 const KDF_ROUNDS: u32 = 200_000;
+
+#[cfg(test)]
+mod bounded_import_tests;
+#[cfg(test)]
+mod bounded_media_tests;
 
 const BASE64: GeneralPurpose = GeneralPurpose::new(&alphabet::STANDARD, general_purpose::NO_PAD);
 
@@ -70,6 +75,15 @@ pub enum Error {
     /// The ciphertext had an invalid length.
     #[error("The ciphertext had an invalid length, expected `{0}`, got `{1}`")]
     Length(usize, usize),
+
+    /// The stored PBKDF2 cost exceeds the caller's explicit import policy.
+    #[error("PBKDF2 import cost {found} exceeds limit {max}")]
+    KdfRoundLimit {
+        /// Stored PBKDF2 iteration count.
+        found: u32,
+        /// Maximum accepted iteration count.
+        max: u32,
+    },
 
     /// Failed to import the store cipher. The export was created using a
     /// different encryption mechanism than the one being used for import
@@ -289,6 +303,31 @@ impl StoreCipher {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn import(passphrase: &str, encrypted: &[u8]) -> Result<Self, Error> {
+        Self::import_passphrase(passphrase, encrypted, None)
+    }
+
+    /// Restore an existing cipher while bounding its declared PBKDF2 cost.
+    ///
+    /// This accepts the same MessagePack and legacy JSON formats as
+    /// [`Self::import`]. Before deriving a passphrase key, it rejects a stored
+    /// iteration count above `max_rounds` with [`Error::KdfRoundLimit`]. It does
+    /// not rewrite the export, lower its cost, or change the original key.
+    /// Normal exports currently use 200,000 iterations. Raw-key/HKDF exports
+    /// still return [`Error::KdfMismatch`]. The iteration limit does not bound
+    /// input parsing allocations; callers must separately limit input size.
+    pub fn import_with_round_limit(
+        passphrase: &str,
+        encrypted: &[u8],
+        max_rounds: u32,
+    ) -> Result<Self, Error> {
+        Self::import_passphrase(passphrase, encrypted, Some(max_rounds))
+    }
+
+    fn import_passphrase(
+        passphrase: &str,
+        encrypted: &[u8],
+        max_rounds: Option<u32>,
+    ) -> Result<Self, Error> {
         // Our old export format used serde_json for the serialization format. Let's
         // first try the new format and if that fails, try the old one.
         let encrypted: EncryptedStoreCipher =
@@ -300,6 +339,11 @@ impl StoreCipher {
 
         let key = match encrypted.kdf_info {
             KdfInfo::Pbkdf2ToChaCha20Poly1305 { rounds, kdf_salt } => {
+                if let Some(max) = max_rounds
+                    && rounds > max
+                {
+                    return Err(Error::KdfRoundLimit { found: rounds, max });
+                }
                 Self::expand_key(passphrase, &kdf_salt, rounds)
             }
             KdfInfo::None | KdfInfo::HkdfSha256 => {
@@ -647,6 +691,62 @@ impl StoreCipher {
         Ok(cipher.decrypt(nonce, value.ciphertext.as_ref())?)
     }
 
+    /// Decrypt and authenticate an already decoded value in its original
+    /// ciphertext allocation, avoiding an additional plaintext-sized buffer.
+    ///
+    /// Callers handling untrusted storage must bound the serialized envelope
+    /// and inspect its ciphertext length before calling this method, or use
+    /// [`Self::decrypt_value_data_bounded_msgpack`].
+    /// As with [`Self::decrypt_value_data`], no plaintext is returned on
+    /// failure.
+    pub fn decrypt_value_data_in_place(&self, mut value: EncryptedValue) -> Result<Vec<u8>, Error> {
+        if value.version != VERSION {
+            return Err(Error::Version(VERSION, value.version));
+        }
+        let cipher = XChaCha20Poly1305::new(self.inner.encryption_key());
+        let nonce = XNonce::cast_from_core(&value.nonce);
+        if let Err(error) = cipher.decrypt_in_place(nonce, &[], &mut value.ciphertext) {
+            value.ciphertext.zeroize();
+            return Err(error.into());
+        }
+        Ok(value.ciphertext)
+    }
+
+    /// Decode a MessagePack at-rest envelope without allocating its
+    /// ciphertext, then check the plaintext length before copying/decrypting.
+    ///
+    /// The caller must separately bound `value.len()` before reading storage.
+    /// Only borrowed bytes are accepted; sequence and owned-buffer forms are
+    /// refused without following an untrusted allocation size hint. rmp-serde
+    /// also exposes invalid UTF-8 strings as borrowed bytes; those are subject
+    /// to the same length and authentication checks. The
+    /// returned allocation has capacity at most `max_bytes + 16` bytes.
+    /// Oversized ciphertexts return [`Error::Length`] with `max_bytes` and
+    /// their implied plaintext length; authentication still precedes any
+    /// successful return. This does not change the existing serialized
+    /// format or decoder.
+    pub fn decrypt_value_data_bounded_msgpack(
+        &self,
+        value: &[u8],
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let value: BorrowedEncryptedValue<'_> = rmp_serde::from_slice(value)?;
+        let length = value
+            .ciphertext
+            .0
+            .len()
+            .checked_sub(16)
+            .ok_or(Error::Length(16, value.ciphertext.0.len()))?;
+        if length > max_bytes {
+            return Err(Error::Length(max_bytes, length));
+        }
+        self.decrypt_value_data_in_place(EncryptedValue {
+            version: value.version,
+            ciphertext: value.ciphertext.0.to_vec(),
+            nonce: value.nonce,
+        })
+    }
+
     /// Expand the given passphrase into a KEY_SIZE long key.
     fn expand_key(passphrase: &str, salt: &[u8], rounds: u32) -> Box<[u8; 32]> {
         let mut key = Box::new([0u8; 32]);
@@ -682,6 +782,34 @@ pub struct EncryptedValue {
     #[serde(with = "serde_bytes")]
     ciphertext: Vec<u8>,
     nonce: [u8; XNONCE_SIZE],
+}
+
+#[derive(Deserialize)]
+struct BorrowedEncryptedValue<'a> {
+    version: u8,
+    #[serde(borrow)]
+    ciphertext: BorrowedBinary<'a>,
+    nonce: [u8; XNONCE_SIZE],
+}
+
+struct BorrowedBinary<'a>(&'a [u8]);
+impl<'de: 'a, 'a> Deserialize<'de> for BorrowedBinary<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BinaryVisitor;
+        impl<'de> serde::de::Visitor<'de> for BinaryVisitor {
+            type Value = &'de [u8];
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a borrowed MessagePack binary ciphertext")
+            }
+            fn visit_borrowed_bytes<E: serde::de::Error>(
+                self,
+                bytes: &'de [u8],
+            ) -> Result<Self::Value, E> {
+                Ok(bytes)
+            }
+        }
+        deserializer.deserialize_bytes(BinaryVisitor).map(Self)
+    }
 }
 
 /// An error representing a failure to decode and encrypted value from base64

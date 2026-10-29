@@ -64,6 +64,9 @@ pub type RumaApiError = UiaaResponse;
 /// converting the raw HTTP response into a Matrix response.
 #[derive(Error, Debug)]
 pub enum HttpError {
+    /// The host retired or expired this request's authority before HTTP IO.
+    #[error("host HTTP request authority is unavailable")]
+    RequestFenceClosed,
     /// Error at the HTTP layer.
     #[error(transparent)]
     Reqwest(#[from] ReqwestError),
@@ -260,6 +263,10 @@ pub enum Error {
     /// This request failed because the local data wasn't sufficient.
     #[error("Local cache doesn't contain all necessary data to perform the action.")]
     InsufficientData,
+
+    /// The caller required encryption but the event cannot be encrypted.
+    #[error("Encryption is required for this event")]
+    EncryptionRequired,
 
     /// Attempting to restore a session after the olm-machine has already been
     /// set up fails

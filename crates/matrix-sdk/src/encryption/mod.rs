@@ -133,7 +133,6 @@ pub use matrix_sdk_base::crypto::{
 };
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 
-#[cfg(feature = "experimental-send-custom-to-device")]
 use crate::config::RequestConfig;
 pub use crate::error::RoomKeyImportError;
 
@@ -1260,6 +1259,32 @@ impl Encryption {
         Ok(device.map(|d| Device { inner: d, client: self.client.clone() }))
     }
 
+    /// Seal one application reply for a freshly queried verified recipient.
+    /// Claims one-time keys but sends no session keys or message. The caller
+    /// must retain the original payload and enforce current room/send authority.
+    pub async fn seal_received_conversation_reply(
+        &self,
+        room: &ruma::RoomId,
+        recipient: &UserId,
+        content: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let identity =
+            self.request_user_identity(recipient).await?.ok_or(Error::InsufficientData)?;
+        if !identity.is_verified() {
+            return Err(Error::InsufficientData);
+        }
+        let _guard = self.spin_lock_store(Some(60000)).await?;
+        self.client.claim_one_time_keys(iter::once(recipient)).await?;
+        let machine = self.client.olm_machine().await;
+        let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        let raw = ruma::serde::Raw::from_json_string(serde_json::to_string(&content)?)?;
+        let (sealed, shares) = machine
+            .seal_room_event_for_verified_user(room, "m.room.message", &raw, recipient)
+            .await?;
+        let shares = shares.into_iter().map(|s| serde_json::json!({"eventType":s.event_type,"txnId":s.txn_id,"messages":s.messages})).collect::<Vec<_>>();
+        Ok(serde_json::json!({"content":sealed.content,"shares":shares}))
+    }
+
     /// A convenience method to retrieve your own device from the store.
     ///
     /// This is the same as calling [`Encryption::get_device()`] with your own
@@ -1403,6 +1428,121 @@ impl Encryption {
 
         let identity = olm.get_identity(user_id, None).await?;
         Ok(identity.map(|i| UserIdentity::new(self.client.clone(), i)))
+    }
+
+    /// Fetch fresh public identity and device keys under an additional host
+    /// request fence, with retries and automatic credential refresh disabled.
+    /// Requires a complete successful response and its exact device. Missing or
+    /// invalid current keys/signatures cannot fall back to a locally verified
+    /// cache entry. This updates the normal crypto store; it never marks an
+    /// identity verified. Absence of the current master key returns `None`.
+    pub async fn request_user_identity_with_fence(
+        &self,
+        user_id: &UserId,
+        expected_device: &DeviceId,
+        fence: Arc<crate::HttpRequestFence>,
+    ) -> Result<Option<UserIdentity>> {
+        fn same<T: serde::Serialize + serde::de::DeserializeOwned>(
+            cached: &T,
+            wire: &impl serde::Serialize,
+        ) -> Result<bool> {
+            let observed: T = serde_json::from_value(serde_json::to_value(wire)?)
+                .map_err(|_| Error::InsufficientData)?;
+            let mut cached = serde_json::to_value(cached)?;
+            let mut observed = serde_json::to_value(observed)?;
+            // Display names and other unsigned annotations are not key evidence.
+            if let Some(value) = cached.as_object_mut() {
+                value.remove("unsigned");
+            }
+            if let Some(value) = observed.as_object_mut() {
+                value.remove("unsigned");
+            }
+            Ok(cached == observed)
+        }
+        let olm = self.client.olm_machine().await;
+        let Some(olm) = olm.as_ref() else { return Ok(None) };
+        let (id, request) = olm.query_keys_for_users(iter::once(user_id));
+        let request = assign!(get_keys::v3::Request::new(), { device_keys: request.device_keys });
+        let response = self
+            .client
+            .send(request)
+            .with_request_config(RequestConfig::new().disable_retry())
+            .with_request_fence(fence)
+            .await?;
+        if !response.failures.is_empty() {
+            return Err(Error::InsufficientData);
+        }
+        // A successful partial response must never turn an old cached identity
+        // into a fresh trust observation. Require this response's exact device,
+        // and compare all cross-signing keys AND signatures with validated data.
+        let Some(master) = response.master_keys.get(user_id) else { return Ok(None) };
+        let signing = response.self_signing_keys.get(user_id).ok_or(Error::InsufficientData)?;
+        let wire_device = response
+            .device_keys
+            .get(user_id)
+            .and_then(|d| d.get(expected_device))
+            .ok_or(Error::InsufficientData)?;
+        self.client.mark_request_as_sent(&id, &response).await?;
+        self.update_state_after_keys_query(&response).await;
+        let identity = olm.get_identity(user_id, None).await?.ok_or(Error::InsufficientData)?;
+        let matches = match &identity {
+            matrix_sdk_base::crypto::UserIdentity::Own(own) => {
+                same(own.master_key(), master)?
+                    && same(own.self_signing_key(), signing)?
+                    && same(
+                        own.user_signing_key(),
+                        response.user_signing_keys.get(user_id).ok_or(Error::InsufficientData)?,
+                    )?
+            }
+            matrix_sdk_base::crypto::UserIdentity::Other(other) => {
+                same(other.master_key(), master)? && same(other.self_signing_key(), signing)?
+            }
+        };
+        let device =
+            olm.get_device(user_id, expected_device, None).await?.ok_or(Error::InsufficientData)?;
+        if !matches || !same(device.as_device_keys(), wire_device)? {
+            return Err(Error::InsufficientData);
+        }
+        Ok(Some(UserIdentity::new(self.client.clone(), identity)))
+    }
+
+    /// Decrypt one already received encrypted event using only the original
+    /// local crypto store. Does not require a Room cache, fetch history, import
+    /// keys or start backup/key recovery. Missing keys are an explicit error.
+    /// Callers must bind the original transport event/room and enforce current
+    /// sender, membership, lease and execution authority independently.
+    pub async fn decrypt_received_room_event(
+        &self,
+        room: &ruma::RoomId,
+        event: &ruma::serde::Raw<ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent>,
+    ) -> Result<crate::deserialized_responses::TimelineEvent> {
+        // The ordinary timeline merges an unencrypted outer relation when the
+        // plaintext has none. Host task routing must see authenticated content
+        // only; keep genuine inner relations but never import that fallback.
+        let mut original: serde_json::Value = serde_json::from_str(event.json().get())?;
+        if let Some(content) = original.get_mut("content").and_then(|c| c.as_object_mut()) {
+            content.remove("m.relates_to");
+        }
+        let authenticated = ruma::serde::Raw::<
+            ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent,
+        >::from_json(serde_json::value::to_raw_value(&original)?);
+        let machine = self.client.olm_machine().await;
+        let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        match machine
+            .try_decrypt_room_event(
+                authenticated.cast_ref(),
+                room,
+                self.client.decryption_settings(),
+            )
+            .await?
+        {
+            matrix_sdk_base::crypto::RoomEventDecryptionResult::Decrypted(event) => {
+                Ok(crate::deserialized_responses::TimelineEvent::from_decrypted(event, None))
+            }
+            matrix_sdk_base::crypto::RoomEventDecryptionResult::UnableToDecrypt(_) => {
+                Err(Error::InsufficientData)
+            }
+        }
     }
 
     /// Returns a stream of device updates, allowing users to listen for
@@ -2357,7 +2497,12 @@ impl Encryption {
 
             let send_result = self
                 .client
-                .send_inner(ruma_request, Some(RequestConfig::short_retry()), Default::default())
+                .send_inner(
+                    ruma_request,
+                    Some(RequestConfig::short_retry()),
+                    Default::default(),
+                    None,
+                )
                 .await;
 
             // If the sending failed we need to collect the failures to report them
