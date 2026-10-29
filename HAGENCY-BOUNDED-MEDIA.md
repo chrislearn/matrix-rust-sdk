@@ -62,3 +62,22 @@ migrated `ubuntu-latest` image (26.04.1). The benchmark workflow now explicitly
 uses Ubuntu 24.04 and retains all six original benchmarks without error
 exemptions. The reviewed toolchain action commit is unchanged; its moving-tag
 comment is replaced with an accurate immutable-revision description.
+
+At `689a19cdbc498b10231a04acd001a44d36f919fa`, all three bounded
+platform jobs and documentation/lint passed. Ubuntu 24.04 also completed actual
+linked-chunk simulation measurements, then CodSpeed's cloud upload returned 401
+(`Repository not found or the user does not have access to it`). That original
+failure remains evidence, not a successful cloud integration. No account,
+credential or external project was provisioned.
+
+For `chrislearn/matrix-rust-sdk` only, the workflow now uses the official pinned
+runner v5.2.1 `CODSPEED_SKIP_UPLOAD` flag. Its exact source tag resolves to
+`8868af5a1e582ade8cbe080ae6f79da12650d131`: `src/cli/shared.rs`
+declares the flag, and `src/executor/orchestrator.rs` checks it only after every
+executor has run, immediately before uploading. All six suites still compile
+and measure with `allow-empty: false`. Each job must upload the actual profile
+files/logs as a seven-day GitHub artifact; missing output fails the job. The
+official `create_profile_folder` writes `profile.*.out` under `TMPDIR`, which is
+set to a dedicated runner temporary folder. The upstream `matrix-org` workflow
+retains cloud upload. Successful fork CI proves offline execution/measurement
+and retained results, not CodSpeed cloud publication or comparison baselines.
