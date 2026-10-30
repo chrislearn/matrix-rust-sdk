@@ -55,6 +55,14 @@ jobs:
         run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib public_weak_client
       - name: Bounded history retention regressions
         run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib event_cache::retention::tests
+      - name: Original governed uploads and default-off response compatibility
+        run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib upload_governor::tests
+      - name: Existing default send queue integration regressions
+        run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite --test integration send_queue
+      - name: Original result custody through SQLite receipt commit
+        run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib send_queue::tests::governed_receipt_and_default_result
+      - name: Conditional retry rejects successor failure under original queue lock
+        run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib send_queue::tests::conditional_unknown_retry
       - name: Strict affected library and test lint
         run: cargo clippy --locked --no-deps -p matrix-sdk-base -p matrix-sdk-sqlite -p matrix-sdk-store-encryption --features matrix-sdk-sqlite/bundled,matrix-sdk-sqlite/crypto-store --lib --tests -- -D warnings
       - name: Strict default weak Client API and test lint

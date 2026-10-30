@@ -42,6 +42,8 @@ use crate::{HttpResult, config::RequestConfig, error::HttpError};
 
 #[cfg(not(target_family = "wasm"))]
 mod native;
+#[cfg(not(target_family = "wasm"))]
+mod upload_preflight;
 #[cfg(target_family = "wasm")]
 mod wasm;
 
@@ -74,10 +76,33 @@ impl MaybeSemaphore {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct BodyOwner {
+    pub(crate) _custody: Arc<dyn Send + Sync>,
+    pub(crate) admissions: Arc<AtomicU64>,
+}
+impl Debug for BodyOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpaqueHttpBodyOwner")
+    }
+}
+struct OwnedBody {
+    bytes: Bytes,
+    _owner: BodyOwner,
+}
+impl AsRef<[u8]> for OwnedBody {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct HttpClient {
     pub(crate) request_fence: Option<Arc<crate::HttpRequestFence>>,
     pub(crate) request_scope: Option<Arc<crate::HttpRequestFence>>,
+    pub(crate) body_owner: Option<BodyOwner>,
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) upload_preflight_limits: bool,
     pub(crate) inner: reqwest::Client,
     pub(crate) request_config: RequestConfig,
     concurrent_request_semaphore: MaybeSemaphore,
@@ -89,6 +114,9 @@ impl HttpClient {
         HttpClient {
             request_fence: None,
             request_scope: None,
+            body_owner: None,
+            #[cfg(not(target_family = "wasm"))]
+            upload_preflight_limits: false,
             inner,
             request_config,
             concurrent_request_semaphore: MaybeSemaphore::new(
@@ -103,7 +131,7 @@ impl HttpClient {
         format!("REQ-{request_id}")
     }
 
-    fn serialize_request<R>(
+    pub(crate) fn serialize_request<R>(
         &self,
         request: R,
         config: RequestConfig,
@@ -133,7 +161,13 @@ impl HttpClient {
                 authentication_input,
                 path_builder_input,
             )?
-            .map(|body| body.freeze());
+            .map(|body| {
+                let bytes = body.freeze();
+                match self.body_owner.clone() {
+                    Some(owner) => Bytes::from_owner(OwnedBody { bytes, _owner: owner }),
+                    None => bytes,
+                }
+            });
 
         Ok(request)
     }
@@ -261,6 +295,34 @@ async fn response_to_http_response(
     let body = response.bytes().await?;
 
     Ok(http_builder.body(body).expect("Can't construct a response using the given body"))
+}
+
+/// Shared incremental collection for explicitly governed POST or preflight
+/// responses. The budget retains their different error/outcome semantics.
+#[cfg(not(target_family = "wasm"))]
+async fn bounded_response(
+    mut response: reqwest::Response,
+    limit: upload_preflight::ResponseBodyLimit,
+) -> HttpResult<http::Response<Bytes>> {
+    let max_bytes = limit.max_bytes;
+    let exceeded = || limit.exceeded();
+    if response.content_length().is_some_and(|length| length > max_bytes as u64) {
+        return Err(exceeded());
+    }
+    let mut builder = http::Response::builder().status(response.status());
+    for (key, value) in response.headers_mut().drain() {
+        if let Some(key) = key {
+            builder.headers_mut().expect("response builder headers").insert(key, value);
+        }
+    }
+    let mut bytes = Vec::with_capacity(max_bytes);
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+            return Err(exceeded());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(builder.body(Bytes::from(bytes)).expect("valid original response builder"))
 }
 
 /// Marker trait to identify the authentication schemes that the

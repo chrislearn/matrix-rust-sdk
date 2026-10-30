@@ -26,8 +26,9 @@ use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::{
-    Room, TransmissionProgress,
-    send_queue::{QueueStorage, RoomSendQueue, RoomSendQueueStorageError, RoomSendQueueUpdate},
+    TransmissionProgress,
+    room::WeakRoom,
+    send_queue::{QueueStorage, RoomSendQueue, RoomSendQueueUpdate},
 };
 
 /// Progress of an operation in abstract units.
@@ -79,7 +80,7 @@ impl RoomSendQueue {
         cache_key: &MediaRequestParameters,
         thumbnail_source: Option<&MediaSource>,
         #[cfg(feature = "unstable-msc4274")] accumulated: &[AccumulatedSentMediaInfo],
-        room: &Room,
+        room: &WeakRoom,
         queue: &QueueStorage,
     ) -> MediaUploadProgressInfo {
         // Determine the item's index, if this is a gallery upload.
@@ -94,17 +95,10 @@ impl RoomSendQueue {
         };
 
         // Get the size of the file being uploaded from the event cache.
-        let bytes = match room.client().media_store().lock().await {
-            Ok(cache) => match cache.get_media_content(cache_key).await {
-                Ok(Some(content)) => content.len(),
-                Ok(None) => 0,
-                Err(err) => {
-                    warn!("error when reading media content from media store: {err}");
-                    0
-                }
-            },
+        let bytes = match media_content_length(room, cache_key).await {
+            Ok(content) => content.unwrap_or(0),
             Err(err) => {
-                warn!("couldn't acquire media store lock: {err}");
+                warn!("could not inspect upload progress size: {err}");
                 0
             }
         };
@@ -161,11 +155,14 @@ impl RoomSendQueue {
     /// upload or return 0 otherwise.
     async fn get_dependent_pending_file_upload_size(
         txn_id: &TransactionId,
-        room: &Room,
-    ) -> Result<Option<usize>, RoomSendQueueStorageError> {
-        let client = room.client();
+        room: &WeakRoom,
+    ) -> Result<Option<usize>, crate::Error> {
+        let Some(active_room) = room.get() else { return Ok(None) };
+        let client = active_room.client();
         let dependent_requests =
             client.state_store().load_dependent_queued_requests(room.room_id()).await?;
+        drop(client);
+        drop(active_room);
 
         // Try to find a depending request which depends on the target one, and that's a
         // media upload.
@@ -197,11 +194,7 @@ impl RoomSendQueue {
             return Ok(None);
         }
 
-        let media_store_guard = client.media_store().lock().await?;
-
-        let maybe_content = media_store_guard.get_media_content(&cache_key).await?;
-
-        Ok(maybe_content.map(|c| c.len()))
+        media_content_length(room, &cache_key).await
     }
 
     /// Create an observable to watch a media's upload progress.
@@ -236,6 +229,25 @@ impl RoomSendQueue {
 
         progress
     }
+}
+
+// Progress reads participate in the same original-operation ownership as upload
+// reads. No whole-file result escapes the worker merely to compute a length.
+async fn media_content_length(
+    room: &WeakRoom,
+    request: &MediaRequestParameters,
+) -> Result<Option<usize>, crate::Error> {
+    let Some(active_room) = room.get() else { return Ok(None) };
+    let client = active_room.client();
+    drop(active_room);
+    #[cfg(not(target_family = "wasm"))]
+    if let Some(governor) = client.send_queue().upload_governor() {
+        let weak = client.downgrade();
+        drop(client);
+        return governor.cache_length(weak, request.clone()).await;
+    }
+    let store = client.media_store().lock().await?;
+    Ok(store.get_media_content(request).await?.map(|bytes| bytes.len()))
 }
 
 /// Estimates the upload progress for a single media file (either a thumbnail or

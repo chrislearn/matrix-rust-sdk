@@ -30,7 +30,11 @@ use reqwest::tls;
 use ruma::api::{IncomingResponseExt as _, OutgoingRequest, error::FromHttpResponseError};
 use tracing::{debug, info, warn};
 
-use super::{DEFAULT_REQUEST_TIMEOUT, HttpClient, TransmissionProgress, response_to_http_response};
+use super::{
+    DEFAULT_REQUEST_TIMEOUT, HttpClient, TransmissionProgress, bounded_response,
+    response_to_http_response,
+    upload_preflight::{ResponseBodyLimit, preflight_limit},
+};
 use crate::{
     HttpResult,
     config::RequestConfig,
@@ -78,12 +82,15 @@ impl HttpClient {
             timeout: Option<Duration>,
             retry_count: &AtomicU64,
             send_progress: SharedObservable<TransmissionProgress>,
+            response_limit: Option<ResponseBodyLimit>,
         ) -> HttpResult<http::Response<Bytes>> {
             let num_attempt = retry_count.fetch_add(1, Ordering::SeqCst);
             debug!(num_attempt, "Sending request");
             let before = ruma::time::Instant::now();
 
-            let response = execute_request(http_client, request, timeout, send_progress).await?;
+            let response =
+                execute_request(http_client, request, timeout, send_progress, response_limit)
+                    .await?;
 
             let request_duration = ruma::time::Instant::now().saturating_duration_since(before);
 
@@ -140,6 +147,13 @@ impl HttpClient {
         }
 
         let retry_count = AtomicU64::new(1);
+        let response_limit = if self.body_owner.is_some() {
+            Some(ResponseBodyLimit::upload())
+        } else if self.upload_preflight_limits {
+            preflight_limit::<R>(&request)
+        } else {
+            None
+        };
 
         let send_request = || {
             let send_progress = send_progress.clone();
@@ -147,12 +161,18 @@ impl HttpClient {
                 // After semaphore waits and on EVERY retry, before transport IO.
                 let _permit = self.request_fence.as_ref().map(|f| f.begin_request()).transpose()?;
                 let _scope = self.request_scope.as_ref().map(|f| f.begin_request()).transpose()?;
+                // Receipt records actual transport admission, never inferred
+                // from an error name.
+                if let Some(owner) = &self.body_owner {
+                    owner.admissions.fetch_add(1, Ordering::AcqRel);
+                }
                 let response = send_request_inner(
                     &self.inner,
                     &request,
                     config.timeout,
                     &retry_count,
                     send_progress,
+                    response_limit,
                 )
                 .await?;
                 let (parts, body) = response.into_parts();
@@ -244,6 +264,7 @@ pub(super) async fn execute_request(
     request: &http::Request<Bytes>,
     timeout: Option<Duration>,
     send_progress: SharedObservable<TransmissionProgress>,
+    response_limit: Option<ResponseBodyLimit>,
 ) -> Result<http::Response<Bytes>, HttpError> {
     use std::convert::Infallible;
 
@@ -285,7 +306,11 @@ pub(super) async fn execute_request(
     };
 
     let response = client.execute(request).await?;
-    Ok(response_to_http_response(response).await?)
+    if let Some(limit) = response_limit {
+        bounded_response(response, limit).await
+    } else {
+        Ok(response_to_http_response(response).await?)
+    }
 }
 
 struct BytesChunks {

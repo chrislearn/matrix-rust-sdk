@@ -45,3 +45,10 @@ This file is an unchanged accepted-requirement body copied from
 read-only identity prerequisite of R05; it does not claim the SDK repairs the
 remaining Client findings. The independent SDK branch starts at
 `a34339e2926c703736e8d66e01cdf9aa933ff4d2`.
+
+## R18 SDK synchronization scope
+
+The same accepted requirement additionally governs the narrow opt-in native
+upload-preflight response repair. Its independent source begins at
+`f2c042cf1359d974c98dd6a0c72ea61086f5deaa`; it does not promote inherited R07
+artifacts, default SDK behavior or unlisted metadata endpoints to qualification.

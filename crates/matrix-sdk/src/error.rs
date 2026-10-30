@@ -67,6 +67,27 @@ pub enum HttpError {
     /// The host retired or expired this request's authority before HTTP IO.
     #[error("host HTTP request authority is unavailable")]
     RequestFenceClosed,
+
+    /// A governed upload response exceeded its bounded JSON response budget.
+    #[cfg(not(target_family = "wasm"))]
+    #[error("Upload response exceeds the safe limit of {max_bytes} bytes")]
+    UploadResponseTooLarge {
+        /// Maximum accepted response body bytes for the original upload.
+        max_bytes: usize,
+    },
+
+    /// An explicitly governed upload preflight exceeded its response budget.
+    /// This is a permanent metadata failure, not an admitted media POST with an
+    /// unknown result. Endpoint labels contain no remote response text or URL.
+    #[cfg(not(target_family = "wasm"))]
+    #[error("Upload preflight {endpoint} response exceeds the safe limit of {max_bytes} bytes")]
+    MetadataResponseTooLarge {
+        /// Stable endpoint label, not a request URL or response description.
+        endpoint: &'static str,
+        /// Maximum accepted decoded response body bytes.
+        max_bytes: usize,
+    },
+
     /// Error at the HTTP layer.
     #[error(transparent)]
     Reqwest(#[from] ReqwestError),
@@ -323,6 +344,11 @@ pub enum Error {
     /// An error occurred in the event cache store.
     #[error(transparent)]
     EventCacheStore(Box<EventCacheStoreError>),
+
+    /// The optional native upload admission or original IO boundary failed.
+    #[cfg(not(target_family = "wasm"))]
+    #[error(transparent)]
+    UploadGovernor(#[from] crate::upload_governor::UploadGovernorError),
 
     /// An error occurred in the media store.
     #[error(transparent)]

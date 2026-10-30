@@ -55,6 +55,8 @@ pub mod room;
 pub mod room_directory_search;
 pub mod room_preview;
 pub mod send_queue;
+#[cfg(not(target_family = "wasm"))]
+pub mod upload_governor;
 pub mod utils;
 pub mod futures {
     //! Named futures returned from methods on types in [the crate root][crate].

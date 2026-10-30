@@ -127,6 +127,8 @@ pub struct ClientBuilder {
     server_versions: Option<BTreeSet<MatrixVersion>>,
     handle_refresh_tokens: bool,
     request_fence: Option<Arc<crate::HttpRequestFence>>,
+    #[cfg(not(target_family = "wasm"))]
+    upload_governor: Option<Arc<crate::upload_governor::UploadGovernor>>,
     base_client: Option<BaseClient>,
     #[cfg(feature = "e2e-encryption")]
     encryption_settings: EncryptionSettings,
@@ -168,6 +170,8 @@ impl ClientBuilder {
             server_versions: None,
             handle_refresh_tokens: false,
             request_fence: None,
+            #[cfg(not(target_family = "wasm"))]
+            upload_governor: None,
             base_client: None,
             #[cfg(feature = "e2e-encryption")]
             encryption_settings: Default::default(),
@@ -504,6 +508,17 @@ impl ClientBuilder {
         self
     }
 
+    /// Use a host-shared native media governor. Disabled by default. This only
+    /// configures media resource ownership, never HTTP authority or callbacks.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn upload_governor(
+        mut self,
+        governor: Arc<crate::upload_governor::UploadGovernor>,
+    ) -> Self {
+        self.upload_governor = Some(governor);
+        self
+    }
+
     /// Specify the Matrix versions supported by the homeserver manually, rather
     /// than `build()` doing it using a `get_supported_versions` request.
     ///
@@ -703,6 +718,12 @@ impl ClientBuilder {
 
         let mut http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
         http_client.request_fence = self.request_fence;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            // Discovery can fetch /versions before Client/SendQueueData exists.
+            // Keep this private endpoint policy separate from body custody.
+            http_client.upload_preflight_limits = self.upload_governor.is_some();
+        }
 
         #[allow(unused_variables)]
         let HomeserverDiscoveryResult { server, homeserver, supported_versions, well_known } =
@@ -730,7 +751,12 @@ impl ClientBuilder {
         let auth_ctx = Arc::new(AuthCtx::new(self.handle_refresh_tokens, allow_insecure_oauth));
 
         // Enable the send queue by default.
-        let send_queue = Arc::new(SendQueueData::new(true));
+        let mut send_queue = SendQueueData::new(true);
+        #[cfg(not(target_family = "wasm"))]
+        {
+            send_queue.upload_governor = self.upload_governor;
+        }
+        let send_queue = Arc::new(send_queue);
 
         let supported_versions = match self.server_versions {
             Some(versions) => Cached(TtlValue::without_expiry(SupportedVersions {
