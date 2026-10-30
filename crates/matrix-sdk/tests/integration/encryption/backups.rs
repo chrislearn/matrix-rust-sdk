@@ -998,7 +998,7 @@ async fn test_enable_from_secret_storage() -> TestResult {
                 }
             }
         })))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
 
@@ -1038,6 +1038,56 @@ async fn test_enable_from_secret_storage() -> TestResult {
         "Importing the secrets again should leave the backups in the enabled state."
     );
 
+    Ok(())
+}
+
+#[async_test]
+async fn test_one_shot_recovery_reports_download_failure_and_retries_enabled_backup() -> TestResult
+{
+    let (builder, server) = test_client_builder_with_server().await;
+    let client = builder
+        .request_config(RequestConfig::new().disable_retry())
+        .with_encryption_settings(EncryptionSettings {
+            backup_download_strategy: BackupDownloadStrategy::OneShot,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    client.restore_session(matrix_session_example2()).await?;
+    let store = init_secret_store(&client, &server).await;
+    mock_query_key_backup(&server).await;
+
+    // The first failed download must not masquerade as restored history.
+    let failing_download = Mock::given(method("GET"))
+        .and(path("_matrix/client/r0/room_keys/keys"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    store.import_secrets().await.expect_err("A failed history download must be reported");
+    assert_eq!(client.encryption().backups().state(), BackupState::Unknown);
+    drop(failing_download);
+
+    let download = Mock::given(method("GET"))
+        .and(path("_matrix/client/r0/room_keys/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"rooms": {}})))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    store.import_secrets().await?;
+    assert_eq!(client.encryption().backups().state(), BackupState::Enabled);
+    drop(download);
+
+    // A repeat import of an already enabled version must still attempt the download,
+    // and must report its failure rather than returning early with success.
+    let _repeat_failure = Mock::given(method("GET"))
+        .and(path("_matrix/client/r0/room_keys/keys"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    store.import_secrets().await.expect_err("An enabled backup must not skip the retry");
+    assert_eq!(client.encryption().backups().state(), BackupState::Unknown);
     Ok(())
 }
 
