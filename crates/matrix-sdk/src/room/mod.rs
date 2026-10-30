@@ -1077,6 +1077,10 @@ impl Room {
             return Ok(());
         }
 
+        self.request_encryption_state_from_server().await
+    }
+
+    async fn request_encryption_state_from_server(&self) -> Result<()> {
         self.client
             .locks()
             .encryption_state_deduplicated_handler
@@ -1102,7 +1106,11 @@ impl Room {
                 // `RoomInfo`.
                 self.update_and_save_room_info(|mut room_info| {
                     room_info.mark_encryption_state_synced();
-                    room_info.set_encryption_event(response);
+                    // A concurrent sync may have installed encryption while this
+                    // read was in flight. Never downgrade that retained fact.
+                    if !room_info.encryption_state().is_encrypted() {
+                        room_info.set_encryption_event(response);
+                    }
                     (room_info, RoomInfoNotableUpdateReasons::empty())
                 })
                 .await?;
@@ -1128,6 +1136,20 @@ impl Room {
     pub async fn latest_encryption_state(&self) -> Result<EncryptionState> {
         self.request_encryption_state().await?;
 
+        Ok(self.encryption_state())
+    }
+
+    /// Refresh a known plaintext or unknown room from the homeserver.
+    ///
+    /// Unlike [`Self::latest_encryption_state`], this also rechecks a cached
+    /// [`EncryptionState::NotEncrypted`], for example after encryption was
+    /// enabled in another session or a previous write had an unknown outcome.
+    /// A room already known to be encrypted stays encrypted: a failed or
+    /// missing state response must never permit subsequent plaintext sends.
+    pub async fn refresh_encryption_state(&self) -> Result<EncryptionState> {
+        if !self.encryption_state().is_encrypted() {
+            self.request_encryption_state_from_server().await?;
+        }
         Ok(self.encryption_state())
     }
 
