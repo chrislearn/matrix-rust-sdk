@@ -128,3 +128,9 @@ The existing three-OS fatal bounded-media lane also runs the actual Governor,
 original result/SQLite receipt, and conditional retry selectors. All prior
 media, encryption, read-only identity, WeakClient, history, and strict checks
 remain. Local native results do not substitute for pending remote OS checks.
+
+The conditional_unknown_retry prefix selects all three real lock-window,
+external-writer/last-SQLite-Client cancellation, and panic-owner tests, including
+retirement after UI confirmation. CI additionally executes the existing default
+send_queue integration suite; these commands remain fatal on all three native OS
+lanes and do not replace any inherited checks.

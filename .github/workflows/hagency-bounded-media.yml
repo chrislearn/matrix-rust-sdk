@@ -57,6 +57,8 @@ jobs:
         run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib event_cache::retention::tests
       - name: Original governed uploads and default-off response compatibility
         run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib upload_governor::tests
+      - name: Existing default send queue integration regressions
+        run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite --test integration send_queue
       - name: Original result custody through SQLite receipt commit
         run: cargo test --locked -p matrix-sdk --features testing,bundled-sqlite,hagency-bounded-history --lib send_queue::tests::governed_receipt_and_default_result
       - name: Conditional retry rejects successor failure under original queue lock
