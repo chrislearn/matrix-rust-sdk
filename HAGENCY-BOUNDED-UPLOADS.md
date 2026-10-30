@@ -23,10 +23,14 @@ commit returns; retirement cannot turn an already acquired receipt into a weak
 upgrade failure and an unproven resend. Worker panic retains unknown charged custody and the
 Client lease, poisons admission and requires restart; it does not claim IO ended.
 
-Queued Governor closures capture weak client/room references and upgrade only
-when original work starts. Existing callers may hold strong clients while
-awaiting their work: in particular send_attachment and the QueueStorage completion
-critical section. This patch does not redesign those original transactions.
+Queued cache/upload/progress closures capture weak client/room references and
+upgrade only when original work starts. The conditional retry is an explicit
+exception: after the caller acquires the original queue critical section, its
+accepted finite job owns that guard and Client while queued and running. It must
+not occupy a Governor job while waiting to acquire the guard. The existing
+client-wide fence is checked again before actual status mutation. Existing
+callers may also hold strong clients while awaiting their work: in particular
+send_attachment and the QueueStorage completion critical section. This patch does not redesign those original transactions.
 Stopped admission returns those observers, releases the original outbox guard and
 leaves a visible recoverable dependent receipt; it does not add a permanent
 strong-client capacity-wait cycle.
