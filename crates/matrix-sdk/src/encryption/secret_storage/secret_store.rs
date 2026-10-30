@@ -401,8 +401,11 @@ impl SecretStore {
     /// [`Device`]: crate::encryption::identities::Device
     #[instrument(fields(user_id, device_id, cross_signing_status))]
     pub async fn import_secrets(&self) -> Result<()> {
-        let olm_machine = self.client.olm_machine().await;
-        let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
+        // Network and nested SDK calls below may overlap crypto-store
+        // generation maintenance. Do not retain a read guard: a queued writer
+        // would block the nested get_own_device/keys_query read behind itself.
+        let olm_machine =
+            self.client.olm_machine().await.as_ref().cloned().ok_or(crate::Error::NoOlmMachine)?;
 
         Span::current()
             .record("user_id", display(olm_machine.user_id()))
@@ -499,5 +502,95 @@ impl SecretStore {
 impl fmt::Debug for SecretStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretStore").field("key", &self.key).finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::Arc, time::Duration};
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path_regex},
+    };
+
+    #[tokio::test]
+    async fn importing_secrets_does_not_block_olm_recreation_during_network_io() {
+        let (client, server) = crate::test_utils::logged_in_client_with_server().await;
+        client.encryption().wait_for_e2ee_initialization_tasks().await;
+        let requested = Arc::new(tokio::sync::Notify::new());
+        let signal = requested.clone();
+        Mock::given(method("GET"))
+            .and(path_regex(r"/account_data/m\.cross_signing\.master$"))
+            .respond_with(move |_: &wiremock::Request| {
+                signal.notify_one();
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"errcode":"M_NOT_FOUND","error":"No secret"}))
+                    .set_delay(Duration::from_secs(5))
+            })
+            .mount(&server)
+            .await;
+        let store = SecretStore { client: client.clone(), key: SecretStorageKey::new() };
+        let import = tokio::spawn(async move { store.import_secrets().await });
+        tokio::time::timeout(Duration::from_secs(2), requested.notified()).await.unwrap();
+        // While import is awaiting HTTP, crypto-store generation maintenance
+        // must be able to replace the machine. A retained read guard prevents
+        // this writer and can deadlock a nested SDK read behind it.
+        let writer =
+            tokio::time::timeout(Duration::from_secs(2), client.base_client().regenerate_olm(None))
+                .await;
+        import.abort();
+        let _ = import.await;
+        writer.expect("secret import retained the machine read lock across HTTP").unwrap();
+    }
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn restored_sqlite_identity_can_sign_its_own_device() {
+        let profile = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/keys/(upload|device_signing/upload|signatures/upload)$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"one_time_key_counts":{},"failures":{}})),
+            )
+            .mount(&server)
+            .await;
+        let client = Client::builder()
+            .homeserver_url(server.uri())
+            .server_versions([ruma::api::MatrixVersion::V1_12])
+            .request_config(crate::config::RequestConfig::new().disable_retry())
+            .sqlite_store(profile.path(), Some("fixture-passphrase"))
+            .build()
+            .await
+            .unwrap();
+        let session = crate::authentication::matrix::MatrixSession {
+            meta: matrix_sdk_base::SessionMeta {
+                user_id: ruma::owned_user_id!("@fixture:example.org"),
+                device_id: ruma::owned_device_id!("RESTORE"),
+            },
+            tokens: crate::test_utils::client::mock_session_tokens(),
+        };
+        client.restore_session(session).await.unwrap();
+        client.encryption().wait_for_e2ee_initialization_tasks().await;
+        client.encryption().bootstrap_cross_signing(None).await.unwrap();
+        let machine = client.olm_machine().await.as_ref().cloned().unwrap();
+        let export = machine.export_cross_signing_keys().await.unwrap().unwrap();
+        let status =
+            tokio::time::timeout(Duration::from_secs(3), machine.import_cross_signing_keys(export))
+                .await
+                .expect("import must finish")
+                .unwrap();
+        assert!(status.is_complete());
+        let own =
+            tokio::time::timeout(Duration::from_secs(3), client.encryption().get_own_device())
+                .await
+                .expect("own device read must finish")
+                .unwrap()
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), own.verify())
+            .await
+            .expect("own device signature must finish after import")
+            .unwrap();
     }
 }
