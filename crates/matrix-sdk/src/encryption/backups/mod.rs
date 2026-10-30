@@ -812,8 +812,8 @@ impl Backups {
         let future = async {
             self.set_state(BackupState::Enabling);
 
-            let olm_machine = self.client.olm_machine().await;
-            let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+            let olm_machine =
+                self.client.olm_machine().await.as_ref().cloned().ok_or(Error::NoOlmMachine)?;
             let backup_machine = olm_machine.backup_machine();
 
             let decryption_key =
@@ -839,9 +839,9 @@ impl Backups {
             if stored_keys.backup_version.as_ref() == Some(&current_version.version)
                 && self.are_enabled().await
             {
-                // If we already have a backup enabled which is using the currently active
-                // backup version, do nothing but tell the caller using the return value that
-                // backups are enabled.
+                // An earlier import may have enabled uploads but failed to download history.
+                // Explicit recovery must be able to retry that same backup without replacing it.
+                self.download_one_shot_backup(decryption_key, current_version.version).await?;
                 Ok(true)
             } else if decryption_key.backup_key_matches(&backup_info) {
                 info!(
@@ -865,25 +865,7 @@ impl Backups {
                     .await?;
                 backup_machine.enable_backup_v1(backup_key).await?;
 
-                // If the user has set up the client to download any room keys, do so now. This
-                // is not really useful in a real scenario since the API to
-                // download room keys is not paginated.
-                //
-                // You need to download all room keys at once, parse a potentially huge JSON
-                // response and decrypt all the room keys found in the backup.
-                //
-                // This doesn't work for any sizeable account.
-                if self.client.inner.e2ee.encryption_settings.backup_download_strategy
-                    == BackupDownloadStrategy::OneShot
-                {
-                    self.set_state(BackupState::Downloading);
-
-                    if let Err(e) =
-                        self.download_all_room_keys(decryption_key, current_version.version).await
-                    {
-                        warn!("Couldn't automatically download all room keys from backup: {e:?}");
-                    }
-                }
+                self.download_one_shot_backup(decryption_key, current_version.version).await?;
 
                 // Trigger the upload of any room keys we might need to upload.
                 self.maybe_trigger_backup();
@@ -920,6 +902,22 @@ impl Backups {
                 Err(e)
             }
         }
+    }
+
+    async fn download_one_shot_backup(
+        &self,
+        decryption_key: BackupDecryptionKey,
+        version: String,
+    ) -> Result<(), Error> {
+        if self.client.inner.e2ee.encryption_settings.backup_download_strategy
+            == BackupDownloadStrategy::OneShot
+        {
+            self.set_state(BackupState::Downloading);
+            // Keep failures visible to the recovery caller. Enabled uploads alone do not mean
+            // that historical room keys have been restored.
+            self.download_all_room_keys(decryption_key, version).await?;
+        }
+        Ok(())
     }
 
     /// Try to resume backups from a backup recovery key we have found in the
