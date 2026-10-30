@@ -4023,6 +4023,17 @@ impl WeakClient {
         self.client.upgrade().map(|inner| Client { inner })
     }
 
+    /// Return whether both weak handles refer to the same original client state.
+    ///
+    /// This compares allocation identity without upgrading either handle,
+    /// reading session metadata or accessing a store. It also works before a
+    /// client has a session and after its last strong owner has gone. Distinct
+    /// clients remain distinct even when configured with the same homeserver
+    /// and stores. Equality does not establish liveness or account authority.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.client, &other.client)
+    }
+
     /// Gets the number of strong (`Arc`) pointers still pointing to this
     /// client.
     #[allow(dead_code)]
@@ -4572,6 +4583,52 @@ pub(crate) mod tests {
         assert!(weak.get().is_none());
         assert!(weak_clone.get().is_none());
         assert!(from_public_constructor.get().is_none());
+    }
+
+    #[async_test]
+    async fn test_public_weak_client_ptr_eq_without_session_or_strong_retention() {
+        // Use real, unlogged clients with the same actual MemoryStore. Client
+        // identity must not be inferred from either session metadata or stores.
+        let shared_store = Arc::new(MemoryStore::new());
+        let build = || {
+            Client::builder()
+                .homeserver_url("https://weak-client.example.invalid")
+                .server_versions([MatrixVersion::V1_0])
+                .store_config(
+                    StoreConfig::new(CrossProcessLockConfig::SingleProcess)
+                        .state_store(shared_store.clone()),
+                )
+                .build()
+        };
+        let client = build().await.unwrap();
+        let other_client = build().await.unwrap();
+        assert!(client.session_meta().is_none());
+        assert!(other_client.session_meta().is_none());
+        let weak = client.downgrade();
+        let weak_clone = weak.clone();
+        let from_client_clone = WeakClient::from_client(&client.clone());
+        let other = other_client.downgrade();
+        assert!(weak.ptr_eq(&weak));
+        assert!(weak.ptr_eq(&weak_clone));
+        assert!(weak_clone.ptr_eq(&from_client_clone));
+        assert!(from_client_clone.ptr_eq(&weak));
+        assert!(!weak.ptr_eq(&other));
+        assert!(!other.ptr_eq(&weak));
+        assert_eq!(Arc::strong_count(&client.inner), 1);
+        assert_eq!(Arc::strong_count(&other_client.inner), 1);
+        drop(client);
+        drop(other_client);
+        assert!(weak.get().is_none());
+        assert!(weak_clone.get().is_none());
+        assert!(from_client_clone.get().is_none());
+        assert!(other.get().is_none());
+        // Weak allocation identity remains meaningful after both ClientInner
+        // values are gone; comparison neither revives nor retains either one.
+        assert!(weak.ptr_eq(&from_client_clone));
+        assert!(!weak.ptr_eq(&other));
+        assert!(!other.ptr_eq(&weak_clone));
+        assert_eq!(weak.strong_count(), 0);
+        assert_eq!(other.strong_count(), 0);
     }
 
     #[async_test]

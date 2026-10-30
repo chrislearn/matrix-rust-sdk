@@ -62,6 +62,9 @@ use crate::{
     },
 };
 
+mod inspect;
+pub use inspect::{ExistingAccountIdentity, InspectAccountError};
+
 /// The database name.
 const DATABASE_NAME: &str = "matrix-sdk-crypto.sqlite3";
 
