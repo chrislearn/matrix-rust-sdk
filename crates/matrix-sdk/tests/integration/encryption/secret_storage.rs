@@ -663,3 +663,53 @@ async fn test_is_secret_storage_enabled() {
         );
     }
 }
+
+#[async_test]
+async fn test_prepared_secret_store_uses_the_saved_key_and_redacts_debug() {
+    use matrix_sdk_base::crypto::secret_storage::SecretStorageKey;
+    use wiremock::matchers::body_json;
+
+    let (client, server) = logged_in_client_with_server().await;
+    let storage = client.encryption().secret_storage();
+    let recovery = client.encryption().recovery();
+    let passphrase = "synthetic-private-passphrase";
+    assert!(
+        !format!("{:?}", storage.create_secret_store().with_passphrase(passphrase))
+            .contains(passphrase)
+    );
+    assert!(!format!("{:?}", recovery.enable().with_passphrase(passphrase)).contains(passphrase));
+
+    let key = SecretStorageKey::new();
+    let saved = key.to_base58();
+    let key_id = key.key_id().to_owned();
+    let info = serde_json::to_value(key.event_content()).unwrap();
+    let user_id = client.user_id().unwrap();
+    Mock::given(method("PUT"))
+        .and(path(format!(
+            "_matrix/client/r0/user/{user_id}/account_data/m.secret_storage.key.{key_id}"
+        )))
+        .and(body_json(info))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!(
+            "_matrix/client/r0/user/{user_id}/account_data/m.secret_storage.default_key"
+        )))
+        .and(body_json(json!({"key":key_id})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Explicit key replaces a previous passphrase, and must be the very same
+    // key the user saved before any network mutation was allowed.
+    let future = storage.create_secret_store().with_passphrase(passphrase).with_prepared_key(key);
+    assert!(!format!("{future:?}").contains(&saved));
+    assert!(!format!("{future:?}").contains(passphrase));
+    assert!(server.received_requests().await.unwrap().iter().all(|r| r.method != "PUT"));
+    let store = future.await.unwrap();
+    assert_eq!(store.secret_storage_key(), saved);
+    server.verify().await;
+}

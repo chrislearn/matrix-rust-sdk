@@ -424,6 +424,10 @@ async fn enable(
         recovery.enable()
     };
 
+    let prepared = matrix_sdk_base::crypto::secret_storage::SecretStorageKey::new();
+    let saved = prepared.to_base58();
+    let enable = enable.with_prepared_key(prepared);
+    assert!(!format!("{enable:?}").contains(&saved));
     let mut progress_stream = enable.subscribe_to_progress();
 
     let task = spawn(async move {
@@ -460,7 +464,8 @@ async fn enable(
         assert_eq!(counter, 4, "We should have gone through 4 states, counter: {counter}");
     });
 
-    enable.await.expect("We should be able to enable recovery");
+    let returned = enable.await.expect("We should be able to enable recovery");
+    assert_eq!(returned, saved, "recovery must publish the key saved before enable");
     task.await.unwrap();
 
     server.verify().await

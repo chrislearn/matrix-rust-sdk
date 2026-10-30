@@ -21,10 +21,10 @@ use ruma::events::secret_storage::default_key::SecretStorageDefaultKeyEventConte
 use super::{Result, SecretStorage, SecretStore};
 
 /// Future returned by [`SecretStorage::create_secret_store()`].
-#[derive(Debug)]
 pub struct CreateStore<'a> {
     pub(super) secret_storage: &'a SecretStorage,
     pub(super) passphrase: Option<&'a str>,
+    pub(super) prepared_key: Option<SecretStorageKey>,
 }
 
 impl<'a> CreateStore<'a> {
@@ -34,8 +34,27 @@ impl<'a> CreateStore<'a> {
     /// method for more info.
     pub fn with_passphrase(mut self, passphrase: &'a str) -> Self {
         self.passphrase = Some(passphrase);
+        self.prepared_key = None;
 
         self
+    }
+}
+
+impl CreateStore<'_> {
+    /// Use a key already generated and saved by the user, before any upload.
+    /// This replaces an earlier passphrase choice; the last setter wins.
+    pub fn with_prepared_key(mut self, key: SecretStorageKey) -> Self {
+        self.prepared_key = Some(key);
+        self.passphrase = None;
+        self
+    }
+}
+impl std::fmt::Debug for CreateStore<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateStore")
+            .field("has_passphrase", &self.passphrase.is_some())
+            .field("has_prepared_key", &self.prepared_key.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -47,7 +66,7 @@ impl<'a> IntoFuture for CreateStore<'a> {
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { secret_storage, passphrase } = self;
+        let Self { secret_storage, passphrase, prepared_key } = self;
 
         Box::pin(async move {
             // Prevent multiple simultaneous calls to this method.
@@ -57,7 +76,9 @@ impl<'a> IntoFuture for CreateStore<'a> {
             let client_copy = secret_storage.client.to_owned();
             let _guard = client_copy.locks().open_secret_store_lock.lock().await;
 
-            let new_key = if let Some(passphrase) = passphrase {
+            let new_key = if let Some(key) = prepared_key {
+                key
+            } else if let Some(passphrase) = passphrase {
                 SecretStorageKey::new_from_passphrase(passphrase)
             } else {
                 SecretStorageKey::new()
