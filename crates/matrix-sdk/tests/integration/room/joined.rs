@@ -1492,3 +1492,42 @@ async fn test_set_own_member_display_name() {
 
     room.set_own_member_display_name(Some(new_name.to_owned())).await.unwrap();
 }
+
+#[async_test]
+async fn test_refresh_encryption_rechecks_cached_plaintext_and_preserves_encrypted_state() {
+    let mock = MatrixMockServer::new().await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id!("!refresh:example.org")).await;
+    mock.mock_room_state_encryption().plain().expect(1).mount().await;
+    assert_matches!(room.latest_encryption_state().await.unwrap(), EncryptionState::NotEncrypted);
+    mock.verify_and_reset().await;
+    mock.mock_room_state_encryption().encrypted().expect(1).mount().await;
+    assert!(room.refresh_encryption_state().await.unwrap().is_encrypted());
+    assert!(room.encryption_state().is_encrypted());
+    mock.verify_and_reset().await;
+    // No network request is allowed to erase the positive encryption fact.
+    mock.mock_room_state_encryption().plain().expect(0).mount().await;
+    assert!(room.refresh_encryption_state().await.unwrap().is_encrypted());
+}
+
+#[async_test]
+async fn test_refresh_encryption_does_not_accept_cached_plaintext_on_failed_or_invalid_reads() {
+    for response in [
+        ResponseTemplate::new(403)
+            .set_body_json(json!({"errcode":"M_FORBIDDEN","error":"Not joined"})),
+        ResponseTemplate::new(200).set_body_json(json!({"algorithm":42})),
+    ] {
+        let mock = MatrixMockServer::new().await;
+        let client = mock.client_builder().build().await;
+        let room = mock.sync_joined_room(&client, room_id!("!refresh:example.org")).await;
+        mock.mock_room_state_encryption().plain().expect(1).mount().await;
+        assert_matches!(
+            room.latest_encryption_state().await.unwrap(),
+            EncryptionState::NotEncrypted
+        );
+        mock.verify_and_reset().await;
+        mock.mock_room_state_encryption().respond_with(response).expect(1).mount().await;
+        assert!(room.refresh_encryption_state().await.is_err());
+        assert_matches!(room.encryption_state(), EncryptionState::NotEncrypted);
+    }
+}
