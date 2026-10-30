@@ -14,6 +14,7 @@
 
 //! Named futures for the recovery support.
 
+use matrix_sdk_base::crypto::secret_storage::SecretStorageKey;
 use std::future::IntoFuture;
 
 use futures_core::Stream;
@@ -29,12 +30,12 @@ use crate::{
 };
 
 /// Named future for the [`Recovery::enable()`] method.
-#[derive(Debug)]
 pub struct Enable<'a> {
     pub(super) recovery: &'a Recovery,
     pub(super) progress: ChannelObservable<EnableProgress>,
     pub(super) wait_for_backups_upload: bool,
     pub(super) passphrase: Option<&'a str>,
+    prepared_key: Option<SecretStorageKey>,
     tracing_span: Span,
 }
 
@@ -45,6 +46,7 @@ impl<'a> Enable<'a> {
             progress: Default::default(),
             wait_for_backups_upload: false,
             passphrase: None,
+            prepared_key: None,
             tracing_span: Span::current(),
         }
     }
@@ -74,8 +76,29 @@ impl<'a> Enable<'a> {
     /// [`Recovery::recover()`] method.
     pub fn with_passphrase(mut self, passphrase: &'a str) -> Self {
         self.passphrase = Some(passphrase);
+        self.prepared_key = None;
 
         self
+    }
+}
+
+impl Enable<'_> {
+    /// Enable recovery with a key already generated and saved by the user.
+    /// This replaces an earlier passphrase choice; the last setter wins.
+    /// No key is generated implicitly when this option is used.
+    pub fn with_prepared_key(mut self, key: SecretStorageKey) -> Self {
+        self.prepared_key = Some(key);
+        self.passphrase = None;
+        self
+    }
+}
+impl std::fmt::Debug for Enable<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnableRecovery")
+            .field("has_passphrase", &self.passphrase.is_some())
+            .field("has_prepared_key", &self.prepared_key.is_some())
+            .field("wait_for_backups_upload", &self.wait_for_backups_upload)
+            .finish_non_exhaustive()
     }
 }
 
@@ -84,7 +107,14 @@ impl<'a> IntoFuture for Enable<'a> {
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { recovery, progress, wait_for_backups_upload, passphrase, tracing_span } = self;
+        let Self {
+            recovery,
+            progress,
+            wait_for_backups_upload,
+            passphrase,
+            prepared_key,
+            tracing_span,
+        } = self;
 
         let future = async move {
             if !recovery.client.encryption().backups().are_enabled().await {
@@ -101,7 +131,9 @@ impl<'a> IntoFuture for Enable<'a> {
 
             let secret_storage = recovery.client.encryption().secret_storage();
 
-            let create_store = if let Some(passphrase) = passphrase {
+            let create_store = if let Some(key) = prepared_key {
+                secret_storage.create_secret_store().with_prepared_key(key)
+            } else if let Some(passphrase) = passphrase {
                 secret_storage.create_secret_store().with_passphrase(passphrase)
             } else {
                 secret_storage.create_secret_store()
