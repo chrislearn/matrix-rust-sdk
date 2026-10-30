@@ -718,6 +718,12 @@ impl ClientBuilder {
 
         let mut http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
         http_client.request_fence = self.request_fence;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            // Discovery can fetch /versions before Client/SendQueueData exists.
+            // Keep this private endpoint policy separate from body custody.
+            http_client.upload_preflight_limits = self.upload_governor.is_some();
+        }
 
         #[allow(unused_variables)]
         let HomeserverDiscoveryResult { server, homeserver, supported_versions, well_known } =

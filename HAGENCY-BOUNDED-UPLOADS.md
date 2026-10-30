@@ -70,14 +70,17 @@ An incoming cache-write can fail before an outbox row exists; the error does not
 claim a pending row was created. Optional duplicate-thumbnail recache remains
 best effort and logs a bounded rejection rather than reading unlimited data.
 
-Only original governed media POST responses have an additional 64 KiB response
-body limit: declared Content-Length is checked before collection and actual
-chunks are counted before appending. An oversized POST response yields durable
-Unknown because there is no trusted media receipt; it cannot trigger automatic
-retry. No whole Client cap is introduced. R18 remains open: /versions,
-/media/config and encryption-state preflight metadata responses still use the
-SDK's existing general response collector. The soak uses trusted bounded metadata
-and does not prove an adversarial end-to-end memory bound.
+Original governed media POST responses retain their 64 KiB response body limit:
+declared Content-Length is checked before collection and actual chunks are
+counted before appending. An oversized POST response yields durable Unknown
+because there is no trusted media receipt; it cannot trigger automatic retry.
+The independent [preflight response change](HAGENCY-BOUNDED-UPLOAD-METADATA.md)
+adds endpoint-specific budgets only for explicitly governed native clients:
+versions 256 KiB, media configuration and empty-key encryption state 64 KiB.
+Oversized GETs have a distinct permanent metadata error rather than POST Unknown.
+No whole Client cap is introduced. Other metadata, well-known and refresh paths
+remain outside that change; the original soak's trusted metadata does not prove
+an adversarial end-to-end memory bound or qualify this new runtime source.
 
 The client-wide HTTP request fence and optional request scope are preserved.
 RequestConfig::short_retry does not replace either fence. Quota ownership adds no

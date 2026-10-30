@@ -31,8 +31,9 @@ use ruma::api::{IncomingResponseExt as _, OutgoingRequest, error::FromHttpRespon
 use tracing::{debug, info, warn};
 
 use super::{
-    DEFAULT_REQUEST_TIMEOUT, HttpClient, TransmissionProgress, bounded_upload_response,
+    DEFAULT_REQUEST_TIMEOUT, HttpClient, TransmissionProgress, bounded_response,
     response_to_http_response,
+    upload_preflight::{ResponseBodyLimit, preflight_limit},
 };
 use crate::{
     HttpResult,
@@ -81,7 +82,7 @@ impl HttpClient {
             timeout: Option<Duration>,
             retry_count: &AtomicU64,
             send_progress: SharedObservable<TransmissionProgress>,
-            response_limit: Option<usize>,
+            response_limit: Option<ResponseBodyLimit>,
         ) -> HttpResult<http::Response<Bytes>> {
             let num_attempt = retry_count.fetch_add(1, Ordering::SeqCst);
             debug!(num_attempt, "Sending request");
@@ -146,6 +147,13 @@ impl HttpClient {
         }
 
         let retry_count = AtomicU64::new(1);
+        let response_limit = if self.body_owner.is_some() {
+            Some(ResponseBodyLimit::upload())
+        } else if self.upload_preflight_limits {
+            preflight_limit::<R>(&request)
+        } else {
+            None
+        };
 
         let send_request = || {
             let send_progress = send_progress.clone();
@@ -164,7 +172,7 @@ impl HttpClient {
                     config.timeout,
                     &retry_count,
                     send_progress,
-                    self.body_owner.as_ref().map(|_| 64 * 1024),
+                    response_limit,
                 )
                 .await?;
                 let (parts, body) = response.into_parts();
@@ -256,7 +264,7 @@ pub(super) async fn execute_request(
     request: &http::Request<Bytes>,
     timeout: Option<Duration>,
     send_progress: SharedObservable<TransmissionProgress>,
-    response_limit: Option<usize>,
+    response_limit: Option<ResponseBodyLimit>,
 ) -> Result<http::Response<Bytes>, HttpError> {
     use std::convert::Infallible;
 
@@ -299,7 +307,7 @@ pub(super) async fn execute_request(
 
     let response = client.execute(request).await?;
     if let Some(limit) = response_limit {
-        bounded_upload_response(response, limit).await
+        bounded_response(response, limit).await
     } else {
         Ok(response_to_http_response(response).await?)
     }

@@ -76,6 +76,18 @@ pub enum HttpError {
         max_bytes: usize,
     },
 
+    /// An explicitly governed upload preflight exceeded its response budget.
+    /// This is a permanent metadata failure, not an admitted media POST with an
+    /// unknown result. Endpoint labels contain no remote response text or URL.
+    #[cfg(not(target_family = "wasm"))]
+    #[error("Upload preflight {endpoint} response exceeds the safe limit of {max_bytes} bytes")]
+    MetadataResponseTooLarge {
+        /// Stable endpoint label, not a request URL or response description.
+        endpoint: &'static str,
+        /// Maximum accepted decoded response body bytes.
+        max_bytes: usize,
+    },
+
     /// Error at the HTTP layer.
     #[error(transparent)]
     Reqwest(#[from] ReqwestError),

@@ -14,7 +14,7 @@ format while bounding original file-buffer jobs. This is not streaming.
 ### Must
 - Keep default SDK paths behavior-compatible and the original 64 MiB accepted App source size.
 - Limit one active owned operation sixteen accepted metadata jobs including active and 128 MiB queued cache-write payload; bounded reads cover main thumbnails restore and post-upload thumbnail recache.
-- Bound only original governed upload POST response bodies to 64 KiB with Content-Length preflight and actual incremental chunk accounting; oversized responses after POST admission become durable Unknown. General metadata responses remain a separately recorded R18.
+- Preserve the original governed upload POST response body limit of 64 KiB with Content-Length preflight and actual incremental chunk accounting; oversized responses after POST admission become durable Unknown. Additional opt-in preflight budgets are governed by the separate task-bounded-upload-metadata contract.
 - Await original SQLite work to actual return even if observers disappear; move synchronous attachment encryption off Tokio workers and keep actual serialized HTTP Bytes owners charged until release.
 - Keep existing client-wide and per-request fences intact; RequestConfig overrides must not erase them or change automatic token refresh.
 - Unknown original transport or worker outcomes persist the existing GenericApiError wedge with safe stable messages and unique non-secret per-failure receipts and retain the original transaction until explicit confirmed unwedge; queue enabling or restart must not resend them.
@@ -32,6 +32,10 @@ format while bounding original file-buffer jobs. This is not streaming.
 ## Boundaries
 
 ### Allowed Changes
+- HAGENCY-BOUNDED-UPLOAD-METADATA.md
+- crates/matrix-sdk/src/http_client/upload_preflight.rs
+- knowledge/requirements/req-client-quality-remediation.md
+- specs/task-bounded-upload-metadata.spec.md
 - ./Cargo.lock
 - crates/matrix-sdk/Cargo.toml
 - crates/matrix-sdk/src/request_fence.rs
@@ -122,7 +126,7 @@ Scenario: Conditional retry rejects replacement failures under the original queu
 
 The Governor branch began at 3ccd3851562b1dee920a6d9f3e40bfd77fe3d279 and additionally merges the separately reviewed SDK4 source 95de9a4e393921c446b2b79e5d72ad09411ef586 before final validation. SDK4 source changes are an inherited dependency prerequisite, not this Governor implementation's boundary delta.
 
-R18 remains open: /versions, /media/config and encryption-state preflight metadata responses use the existing general SDK response collector. The upload soak uses trusted bounded metadata responses and cannot qualify an adversarial end-to-end process-memory bound. No global Client response cap or new request_scope is added.
+The combined upload candidate starts at separately reviewed SDK4 source 95de9a4e and contains the f2c042cf R07 component plus the additional R18 increment governed independently by task-bounded-upload-metadata.spec.md. That Task defines only versions, media-config and empty encryption-state response budgets. All original POST outcome semantics, 64 MiB source acceptance, one active operation, sixteen metadata jobs, 128 MiB incoming-write budget, default-off behavior, authentication and fence requirements remain unchanged. Final validation and memory evidence must identify the new candidate source and executable; de44 measurements are historical. The upload soak still uses trusted metadata and does not qualify an adversarial end-to-end process bound. Other general SDK response endpoints remain outside this policy. No global Client response cap or new request_scope is added.
 
 The existing three-OS fatal bounded-media lane also runs the actual Governor,
 original result/SQLite receipt, and conditional retry selectors. All prior

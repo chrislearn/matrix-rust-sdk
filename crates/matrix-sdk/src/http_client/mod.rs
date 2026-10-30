@@ -42,6 +42,8 @@ use crate::{HttpResult, config::RequestConfig, error::HttpError};
 
 #[cfg(not(target_family = "wasm"))]
 mod native;
+#[cfg(not(target_family = "wasm"))]
+mod upload_preflight;
 #[cfg(target_family = "wasm")]
 mod wasm;
 
@@ -99,6 +101,8 @@ pub(crate) struct HttpClient {
     pub(crate) request_fence: Option<Arc<crate::HttpRequestFence>>,
     pub(crate) request_scope: Option<Arc<crate::HttpRequestFence>>,
     pub(crate) body_owner: Option<BodyOwner>,
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) upload_preflight_limits: bool,
     pub(crate) inner: reqwest::Client,
     pub(crate) request_config: RequestConfig,
     concurrent_request_semaphore: MaybeSemaphore,
@@ -111,6 +115,8 @@ impl HttpClient {
             request_fence: None,
             request_scope: None,
             body_owner: None,
+            #[cfg(not(target_family = "wasm"))]
+            upload_preflight_limits: false,
             inner,
             request_config,
             concurrent_request_semaphore: MaybeSemaphore::new(
@@ -291,14 +297,15 @@ async fn response_to_http_response(
     Ok(http_builder.body(body).expect("Can't construct a response using the given body"))
 }
 
-/// Only original governed upload POST responses use this incremental bound.
-/// Metadata/version/sync responses retain their existing behavior (R18).
+/// Shared incremental collection for explicitly governed POST or preflight
+/// responses. The budget retains their different error/outcome semantics.
 #[cfg(not(target_family = "wasm"))]
-async fn bounded_upload_response(
+async fn bounded_response(
     mut response: reqwest::Response,
-    max_bytes: usize,
+    limit: upload_preflight::ResponseBodyLimit,
 ) -> HttpResult<http::Response<Bytes>> {
-    let exceeded = || HttpError::UploadResponseTooLarge { max_bytes };
+    let max_bytes = limit.max_bytes;
+    let exceeded = || limit.exceeded();
     if response.content_length().is_some_and(|length| length > max_bytes as u64) {
         return Err(exceeded());
     }
