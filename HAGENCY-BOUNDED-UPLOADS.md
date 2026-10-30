@@ -44,7 +44,18 @@ GenericApiError message. Its live and restored errors carry the same receipt.
 The conditional API holds the original Room queue store lock, checks all current
 main/thumbnail/event statuses before any clear, and refuses a successor unknown
 or an already active original request. Ordinary retries pass None and refuse any
-current related unknown. Legacy SendHandle::unwedge remains unconditional for
+current related unknown. After waiting for the original queue lock, the
+conditional API also admits its status mutation through the existing client-wide
+fence before any write. Retirement while waiting refuses the retry; an admitted
+original status write retains that permit until actual completion. In an opted-in
+client, the caller acquires the original queue guard before occupying a Governor
+job, then transfers that guard/client/permit to the existing owned worker. The
+worker never reacquires a QueueStorage lock. Observer cancellation cannot drop
+started original status IO; a full queue refuses admission without clearing the
+unknown row. Unknown panic retains the actual guard and client with poisoned
+custody. Final SQLite owners and queued closures are explicitly released inside
+their original runtime context before quota reuse; zero job counters do not mean
+all SDK background pool teardown has completed. No new request_scope or authentication policy is added. Legacy SendHandle::unwedge remains unconditional for
 compatibility; this is not a cross-process SQLite compare-and-swap guarantee.
 The restart/enable guarantee applies after the Unknown status is durably
 recorded. A process crash or persistence failure between the HTTP side effect

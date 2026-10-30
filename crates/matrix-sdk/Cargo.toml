@@ -200,6 +200,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 ctor.workspace = true
 proptest.workspace = true
+rusqlite = { version = "=0.40.2", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 wiremock.workspace = true
 

@@ -241,6 +241,8 @@ impl UploadGovernor {
             payload,
             active: AtomicBool::new(false),
             client: OnceLock::new(),
+            original_owner: Mutex::new(None),
+            runtime: runtime.clone(),
         });
         let live = Arc::new(AtomicBool::new(true));
         let (done, receiver) = oneshot::channel();
@@ -333,10 +335,23 @@ pub(crate) struct UploadCustody {
     payload: usize,
     active: AtomicBool,
     client: OnceLock<crate::Client>,
+    original_owner: Mutex<Option<Box<dyn Send>>>,
+    runtime: Handle,
 }
 impl UploadCustody {
     pub(crate) fn retain_client(&self, client: &crate::Client) {
         let _ = self.client.set(client.clone());
+    }
+    // The retry status operation additionally transfers its already acquired
+    // queue guard and original admission permit. A panic must retain these
+    // actual owners with unknown custody, not merely retain a byte counter.
+    pub(crate) fn retain_original_owner(&self, owner: impl Send + 'static) {
+        *self.original_owner.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some(Box::new(owner));
+    }
+    pub(crate) fn release_original_owner(&self) {
+        let owner = self.original_owner.lock().unwrap_or_else(|error| error.into_inner()).take();
+        drop(owner);
     }
 }
 impl std::fmt::Debug for UploadCustody {
@@ -346,6 +361,15 @@ impl std::fmt::Debug for UploadCustody {
 }
 impl Drop for UploadCustody {
     fn drop(&mut self) {
+        // SQLite's final pool/client destructor schedules physical cleanup on
+        // Tokio. A last owner may be released by this OS worker or a Bytes
+        // clone after block_on returns; enter the original job's runtime.
+        let runtime = self.runtime.clone();
+        let _context = runtime.enter();
+        let owner = self.original_owner.get_mut().unwrap_or_else(|error| error.into_inner()).take();
+        drop(owner);
+        drop(self.client.take());
+        // Actual owners finish before the admission counter becomes reusable.
         if let Some(inner) = self.inner.upgrade() {
             {
                 let mut s = inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -383,6 +407,8 @@ where
         &self.custody
     }
     fn run(mut self: Box<Self>) {
+        let runtime = self.runtime.clone();
+        let _context = runtime.enter();
         let operation = self.operation.take().expect("original job is run once");
         let result = if self.live.load(Ordering::Acquire) {
             self.runtime.block_on(operation(self.custody.clone(), self.live.clone()))
@@ -392,11 +418,15 @@ where
         if let Some(done) = self.done.take() {
             let _ = done.send(result);
         }
+        drop(self);
     }
     fn cancel(mut self: Box<Self>, reason: UploadGovernorError) {
+        let runtime = self.runtime.clone();
+        let _context = runtime.enter();
         if let Some(done) = self.done.take() {
             let _ = done.send(Err(reason.into()));
         }
+        drop(self);
     }
 }
 impl<T, E: From<UploadGovernorError>, F> Drop for Job<T, E, F> {

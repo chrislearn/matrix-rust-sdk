@@ -52,6 +52,10 @@ impl HttpRequestFence {
         *active = active.checked_add(1).ok_or(HttpError::RequestFenceClosed)?;
         Ok(HttpRequestPermit { fence: self.clone() })
     }
+    #[cfg(all(test, not(target_family = "wasm")))]
+    pub(crate) fn active_for_test(&self) -> usize {
+        *self.active.lock().unwrap()
+    }
     /// Retire and join all already admitted HTTP operations. Dropping a waiter
     /// never revives authority or discards the original requests' permits.
     pub async fn retire_and_drain(&self) -> Result<(), HttpError> {

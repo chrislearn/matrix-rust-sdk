@@ -2942,6 +2942,15 @@ struct MediaHandles {
     upload_file_txn: OwnedTransactionId,
 }
 
+// A governed retry transfers the already acquired original queue lock. The
+// worker never awaits that lock, preventing a cycle with existing outbox
+// completion that holds it while awaiting a media-cache Governor operation.
+#[cfg(not(target_family = "wasm"))]
+struct RetryOriginalOwner {
+    guard: StoreLockGuard,
+    permit: std::sync::OnceLock<crate::HttpRequestPermit>,
+}
+
 /// Future returned by [`RoomSendQueue::send`].
 #[allow(missing_debug_implementations)]
 pub struct SendEvent<'a> {
@@ -3189,15 +3198,56 @@ impl SendHandle {
     /// user confirmation. This coordinates this original Room queue, not
     /// independent processes writing the same store. The legacy
     /// [`Self::unwedge`] API keeps its unconditional behavior for existing
-    /// hosts.
+    /// hosts. With an UploadGovernor, acquire the original queue lock before
+    /// admission, then transfer it to the owned operation; observer
+    /// cancellation cannot release started original state IO. Without
+    /// opt-in, the original SDK asynchronous status IO ownership is
+    /// retained.
     #[cfg(not(target_family = "wasm"))]
     pub async fn unwedge_if_current_error(
         &self,
         confirmed_unknown: Option<&str>,
     ) -> Result<bool, RoomSendQueueError> {
-        let room = &self.room.inner;
-        let guard = room.queue.store.lock().await;
+        // No Governor job is occupied while waiting for this original lock.
+        let guard = self.room.inner.queue.store.lock().await;
         let client = guard.client()?;
+        let owner = Arc::new(RetryOriginalOwner { guard, permit: std::sync::OnceLock::new() });
+        if let Some(governor) = client.send_queue().upload_governor() {
+            let handle = self.clone();
+            let confirmed_unknown = confirmed_unknown.map(str::to_owned);
+            return governor
+                .submit(0, move |custody, _| async move {
+                    custody.retain_client(&client);
+                    custody.retain_original_owner(owner.clone());
+                    let result = handle
+                        .unwedge_if_current_error_locked(
+                            &owner,
+                            &client,
+                            confirmed_unknown.as_deref(),
+                        )
+                        .await;
+                    // Only normal completion releases these owners. On unwind
+                    // the existing poisoned custody retains
+                    // guard/client/permit.
+                    drop(owner);
+                    custody.release_original_owner();
+                    result
+                })?
+                .await;
+        }
+        // Existing non-opted-in hosts keep the SDK's original async status IO
+        // ownership. The legacy unconditional unwedge method is unchanged.
+        self.unwedge_if_current_error_locked(&owner, &client, confirmed_unknown).await
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    async fn unwedge_if_current_error_locked(
+        &self,
+        owner: &RetryOriginalOwner,
+        client: &Client,
+        confirmed_unknown: Option<&str>,
+    ) -> Result<bool, RoomSendQueueError> {
+        let room = &self.room.inner;
         let store = client.state_store();
         let rows = store
             .load_send_queue_requests(&room.queue.room_id)
@@ -3219,7 +3269,8 @@ impl SendHandle {
         }
         transactions.sort();
         transactions.dedup();
-        if guard
+        if owner
+            .guard
             .being_sent
             .as_ref()
             .is_some_and(|active| transactions.contains(&active.transaction_id))
@@ -3243,6 +3294,24 @@ impl SendHandle {
         if !found || (confirmed_unknown.is_some() && !found_unknown) {
             return Ok(false);
         }
+        // A host may retire this original account while we await the queue
+        // lock. Reuse its existing client-wide admission immediately before
+        // any status mutation; do not add a request_scope or alter refresh.
+        // Once admitted, retain the permit through the actual status writes.
+        match client
+            .inner
+            .http_client
+            .request_fence
+            .as_ref()
+            .map(|fence| fence.begin_request())
+            .transpose()
+        {
+            Ok(Some(permit)) => {
+                let _ = owner.permit.set(permit);
+            }
+            Ok(None) => {}
+            Err(_) => return Ok(false),
+        }
         // All related state is validated before the first write, while the
         // same original queue lock also excludes its sending/status actor.
         for transaction in &transactions {
@@ -3251,7 +3320,6 @@ impl SendHandle {
                 .await
                 .map_err(RoomSendQueueStorageError::from)?;
         }
-        drop(guard);
         room.notifier.notify_one();
         self.room.send_update(RoomSendQueueUpdate::RetryEvent {
             transaction_id: self.transaction_id.clone(),
@@ -3886,9 +3954,24 @@ mod tests {
         };
         let mock = MatrixMockServer::new().await;
         let directory = tempfile::tempdir().unwrap();
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fence = Arc::new(crate::HttpRequestFence::new({
+            let live = live.clone();
+            move || live.load(std::sync::atomic::Ordering::Acquire)
+        }));
         let client = mock
             .client_builder()
-            .on_builder(|builder| builder.sqlite_store(directory.path(), None))
+            .on_builder(|builder| {
+                builder
+                    .sqlite_store(directory.path(), None)
+                    .request_fence(fence.clone())
+                    .upload_governor(Arc::new(
+                        crate::upload_governor::UploadGovernor::new(
+                            crate::upload_governor::UploadLimits::default(),
+                        )
+                        .unwrap(),
+                    ))
+            })
             .build()
             .await;
         client.send_queue().set_enabled(false).await;
@@ -4001,5 +4084,238 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.error.is_none()));
         assert_eq!(mock.received_requests().await.unwrap().len(), baseline);
+        // An account can retire after UI confirmation but before the pending
+        // retry acquires the original lock. Its unknown status must survive.
+        for transaction in [file_txn, thumb_txn] {
+            store
+                .update_send_queue_request_status(
+                    room.room_id(),
+                    transaction,
+                    Some(QueueWedgeError::from(&a)),
+                )
+                .await
+                .unwrap();
+        }
+        let guard = queue.inner.queue.store.lock().await;
+        let mut retry = Box::pin(handle.unwedge_if_current_error(Some(receipt_a)));
+        assert!(futures_util::poll!(&mut retry).is_pending());
+        live.store(false, std::sync::atomic::Ordering::Release);
+        fence.retire();
+        drop(guard);
+        assert!(!tokio::time::timeout(Duration::from_secs(5), retry).await.unwrap().unwrap());
+        let rows = store.load_send_queue_requests(room.room_id()).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|row| row
+                .error
+                .as_ref()
+                .and_then(crate::upload_governor::unknown_wedge_receipt)
+                == Some(receipt_a))
+        );
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            baseline,
+            "retired confirmation cannot mutate the original durable gate or start HTTP"
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_unknown_retry_cancel_retains_original_sqlite_guard_client_and_quota() {
+        use std::time::{Duration, Instant};
+
+        use crate::{
+            attachment::AttachmentConfig,
+            test_utils::mocks::MatrixMockServer,
+            upload_governor::{
+                UploadGovernor, UploadGovernorError, UploadLimits, UploadShutdown, persist_unknown,
+                unknown_upload_receipt,
+            },
+        };
+        let fence = Arc::new(crate::HttpRequestFence::new(|| true));
+        let governor = Arc::new(UploadGovernor::new(UploadLimits::default()).unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let mock = MatrixMockServer::new().await;
+        let client = mock
+            .client_builder()
+            .on_builder(|builder| {
+                builder
+                    .sqlite_store(directory.path(), None)
+                    .request_fence(fence.clone())
+                    .upload_governor(governor.clone())
+            })
+            .build()
+            .await;
+        client.send_queue().set_enabled(false).await;
+        let room = mock.sync_joined_room(&client, room_id!("!cancel-retry:test")).await;
+        let queue = room.send_queue();
+        let handle = queue
+            .send_attachment("source", mime::IMAGE_JPEG, vec![7; 16], AttachmentConfig::new())
+            .await
+            .unwrap();
+        let rows = client.state_store().load_send_queue_requests(room.room_id()).await.unwrap();
+        let error = persist_unknown(UploadGovernorError::OutcomeUnknown.into());
+        client
+            .state_store()
+            .update_send_queue_request_status(
+                room.room_id(),
+                &rows[0].transaction_id,
+                Some(matrix_sdk_base::store::QueueWedgeError::from(&error)),
+            )
+            .await
+            .unwrap();
+        let receipt = unknown_upload_receipt(&error).unwrap().to_owned();
+        let room_id = room.room_id().to_owned();
+        let original = queue.inner.clone();
+        let weak = client.downgrade();
+        let baseline = mock.received_requests().await.unwrap().len();
+        // WAL allows the original metadata SELECT while this actual external
+        // writer excludes the original SDK UPDATE. No pre-worker test hook is
+        // used to simulate an in-flight StateStore operation.
+        let sqlite = rusqlite::Connection::open(
+            directory.path().join(matrix_sdk_sqlite::STATE_STORE_DATABASE_NAME),
+        )
+        .unwrap();
+        sqlite.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let observing =
+            tokio::spawn(async move { handle.unwedge_if_current_error(Some(&receipt)).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fence.active_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual original status write admitted behind external SQLite writer");
+        observing.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), observing)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled(),
+            "observer can finish while original mutation is held"
+        );
+        drop(queue);
+        drop(room);
+        drop(client);
+        assert!(weak.get().is_some(), "original owned state operation keeps its Client");
+        assert_eq!(governor.stats().active, 1);
+        assert_eq!(governor.stats().jobs, 1);
+        let mut same_lock = Box::pin(original.queue.store.lock());
+        assert!(
+            futures_util::poll!(&mut same_lock).is_pending(),
+            "original worker, not observer, holds the actual queue guard"
+        );
+        drop(same_lock);
+        assert!(matches!(governor.shutdown_until(Instant::now()), UploadShutdown::Pending(_)));
+        assert_eq!(fence.active_for_test(), 1, "original state-write permit survives cancellation");
+        sqlite.execute_batch("COMMIT").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while governor.stats().jobs != 0 || weak.get().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual SQLite completion returns original owners and quota");
+        assert!(matches!(
+            governor.shutdown_until(Instant::now() + Duration::from_secs(5)),
+            UploadShutdown::Joined(_)
+        ));
+        assert_eq!(fence.active_for_test(), 0);
+        let store =
+            matrix_sdk_sqlite::SqliteStateStore::open(directory.path(), None).await.unwrap();
+        let persisted =
+            matrix_sdk_base::store::StateStore::load_send_queue_requests(&store, &room_id)
+                .await
+                .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].transaction_id, rows[0].transaction_id);
+        assert!(
+            persisted[0].error.is_none(),
+            "actual original SQLite clear completed after cancellation"
+        );
+        assert_eq!(mock.received_requests().await.unwrap().len(), baseline);
+    }
+
+    #[tokio::test]
+    async fn conditional_unknown_retry_panic_retains_actual_guard_and_client_as_unknown() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::{Duration, Instant},
+        };
+
+        use crate::{
+            attachment::AttachmentConfig,
+            test_utils::mocks::MatrixMockServer,
+            upload_governor::{
+                UploadGovernor, UploadGovernorError, UploadLimits, UploadShutdown, persist_unknown,
+                unknown_upload_receipt,
+            },
+        };
+        let panic_now = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(crate::HttpRequestFence::new({
+            let panic_now = panic_now.clone();
+            move || {
+                assert!(
+                    !(panic_now.load(Ordering::Acquire)
+                        && std::thread::current().name() == Some("matrix-upload-io")),
+                    "controlled original retry failure"
+                );
+                true
+            }
+        }));
+        let governor = Arc::new(UploadGovernor::new(UploadLimits::default()).unwrap());
+        let mock = MatrixMockServer::new().await;
+        // Memory store avoids retaining a test filesystem on the deliberate
+        // poison path; real SQLite completion is covered by the adjacent test.
+        let client = mock
+            .client_builder()
+            .on_builder(|builder| {
+                builder.request_fence(fence.clone()).upload_governor(governor.clone())
+            })
+            .build()
+            .await;
+        client.send_queue().set_enabled(false).await;
+        let room = mock.sync_joined_room(&client, room_id!("!panic-retry:test")).await;
+        let queue = room.send_queue();
+        let handle = queue
+            .send_attachment("source", mime::IMAGE_JPEG, vec![7; 16], AttachmentConfig::new())
+            .await
+            .unwrap();
+        let rows = client.state_store().load_send_queue_requests(room.room_id()).await.unwrap();
+        let error = persist_unknown(UploadGovernorError::OutcomeUnknown.into());
+        client
+            .state_store()
+            .update_send_queue_request_status(
+                room.room_id(),
+                &rows[0].transaction_id,
+                Some(matrix_sdk_base::store::QueueWedgeError::from(&error)),
+            )
+            .await
+            .unwrap();
+        panic_now.store(true, Ordering::Release);
+        assert!(matches!(
+            handle.unwedge_if_current_error(unknown_upload_receipt(&error)).await,
+            Err(super::RoomSendQueueError::UploadGovernor(UploadGovernorError::WorkerFailed))
+        ));
+        let original = queue.inner.clone();
+        let weak = client.downgrade();
+        drop(handle);
+        drop(queue);
+        drop(room);
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while governor.stats().unknown != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(weak.get().is_some());
+        assert_eq!(governor.stats().jobs, 1);
+        let mut same_lock = Box::pin(original.queue.store.lock());
+        assert!(
+            futures_util::poll!(&mut same_lock).is_pending(),
+            "unknown custody retains the actual original guard, not just a counter"
+        );
+        assert!(matches!(governor.shutdown_until(Instant::now()), UploadShutdown::Pending(_)));
     }
 }

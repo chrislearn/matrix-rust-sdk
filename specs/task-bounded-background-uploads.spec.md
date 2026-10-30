@@ -32,6 +32,9 @@ format while bounding original file-buffer jobs. This is not streaming.
 ## Boundaries
 
 ### Allowed Changes
+- Cargo.lock
+- crates/matrix-sdk/Cargo.toml
+- crates/matrix-sdk/src/request_fence.rs
 - .github/workflows/hagency-bounded-media.yml
 - crates/matrix-sdk/src/lib.rs
 - crates/matrix-sdk/src/client/mod.rs
@@ -110,10 +113,10 @@ Scenario: Conditional retry rejects replacement failures under the original queu
     Package: matrix-sdk
     Filter: send_queue::tests::conditional_unknown_retry
     Level: integration
-    Test Double: actual SQLite outbox and original Room queue lock with controlled status replacement
+    Test Double: actual SQLite outbox original queue lock external SQLite writer exclusion and controlled native worker failure
   Given a confirmed unknown receipt or an ordinary stale known-failure retry
-  When a newer unknown main or thumbnail status is committed while that operation waits for the original queue lock
-  Then every related status is checked before any clear the newer receipt and original transactions remain and no HTTP starts
+  When a newer unknown main or thumbnail status is committed or original client authority retires while that operation waits for the original queue lock
+  Then every related status is checked before any clear the newer receipt and original transactions remain no HTTP starts and admitted original SQLite guard permit client and quota persist through observer cancellation until real completion
 
 ## Decisions
 
