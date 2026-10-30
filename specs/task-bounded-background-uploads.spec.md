@@ -32,7 +32,7 @@ format while bounding original file-buffer jobs. This is not streaming.
 ## Boundaries
 
 ### Allowed Changes
-- Cargo.lock
+- ./Cargo.lock
 - crates/matrix-sdk/Cargo.toml
 - crates/matrix-sdk/src/request_fence.rs
 - .github/workflows/hagency-bounded-media.yml
@@ -134,3 +134,8 @@ external-writer/last-SQLite-Client cancellation, and panic-owner tests, includin
 retirement after UI confirmation. CI additionally executes the existing default
 send_queue integration suite; these commands remain fatal on all three native OS
 lanes and do not replace any inherited checks.
+
+Root lockfile boundaries use the exact ./Cargo.lock spelling because
+agent-spec 1.4 only classifies slash-containing paths or selected extensions as
+path boundaries. Normalization resolves that literal to Cargo.lock; no wildcard
+or omitted lockfile change is used.
